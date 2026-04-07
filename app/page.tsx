@@ -58,12 +58,12 @@ export default function Login() {
           
           <div className="space-y-4 mb-6">
             <div className="space-y-1 flex flex-col">
-              <label htmlFor="email" className="font-sans text-[10px] uppercase text-text-dim tracking-widest">
+              <label htmlFor="auth-email" className="font-sans text-[10px] uppercase text-text-dim tracking-widest">
                 Operator Email
               </label>
               <input 
-                id="email"
-                name="email"
+                id="auth-email"
+                name="auth-email"
                 autoComplete="email"
                 type="email" 
                 value={email} 
@@ -74,12 +74,12 @@ export default function Login() {
             </div>
             
             <div className="space-y-1 flex flex-col">
-              <label htmlFor="password" className="font-sans text-[10px] uppercase text-text-dim tracking-widest">
+              <label htmlFor="auth-password" className="font-sans text-[10px] uppercase text-text-dim tracking-widest">
                 Passcode
               </label>
               <input 
-                id="password"
-                name="password"
+                id="auth-password"
+                name="auth-password"
                 autoComplete={isSignUp ? "new-password" : "current-password"}
                 type="password" 
                 value={password} 
