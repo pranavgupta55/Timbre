@@ -1,79 +1,69 @@
 "use client";
 
-import { useEffect, useRef, useState, type ChangeEvent, type Dispatch, type SetStateAction } from "react";
+import Link from "next/link";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import Script from "next/script";
 import WaveSurfer from "wavesurfer.js";
 import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
-import { supabase } from "@/lib/supabase";
+import { Check, FolderOpen, Library, Loader2, Save, Trash2, Upload, Waves } from "lucide-react";
+import { EditorTrackCard } from "@/components/editor/EditorTrackCard";
+import { Badge } from "@/components/ui/TacticalUI";
 import { useAuth } from "@/context/AuthContext";
-import { Badge, DataCard, Eyebrow } from "@/components/ui/TacticalUI";
+import {
+  clearEditorDraftSnapshot,
+  loadEditorDraftSnapshot,
+  saveEditorDraftSnapshot,
+  type PersistedEditorTrack,
+  type PersistedTrackSegment,
+} from "@/lib/editor-draft-storage";
+import { buildSegmentStoragePath, fetchHighlightInventory, stripExtension, type ApprovedSource } from "@/lib/highlights";
+import { supabase } from "@/lib/supabase";
+import { cn } from "@/lib/utils";
 
-const WAVEFORM_HEIGHT = 160;
+const WAVEFORM_HEIGHT = 176;
 const DEFAULT_SEGMENT_LENGTH = 15;
 const DEFAULT_FADE_SECONDS = "2.0";
-const UPLOADED_SOURCE_MANIFEST_KEY = "timbre-uploaded-source-manifest";
 
-type UploadedManifestEntry = {
-  hash: string;
-  sourceName: string;
-  sourceSize: number;
-  storagePath: string | null;
-  uploadedAt: string;
-};
-
-type QueueItem = {
-  id: string;
-  file: File;
-  sourceHash: string;
-  displayName: string;
-  relativePath: string;
-};
-
-type TrackSegment = {
-  id: string;
-  start: number;
-  end: number;
-  fadeInInput: string;
-  fadeOutInput: string;
-};
-
-type SessionUpload = {
-  id: string;
-  label: string;
-  status: "uploaded" | "approved";
-  timestamp: string;
-};
+type StatusTone = "info" | "success" | "error";
+type StatusMessage = { tone: StatusTone; text: string } | null;
+type DragLane = "queued";
+type DropLane = "approved" | "library" | null;
 
 const formatTime = (time: number) => {
-  if (Number.isNaN(time)) return "00:00.00";
-  const m = Math.floor(time / 60)
+  if (!Number.isFinite(time)) return "00:00.00";
+
+  const minutes = Math.floor(time / 60)
     .toString()
     .padStart(2, "0");
-  const s = Math.floor(time % 60)
+  const seconds = Math.floor(time % 60)
     .toString()
     .padStart(2, "0");
-  const ms = Math.floor((time % 1) * 100)
+  const milliseconds = Math.floor((time % 1) * 100)
     .toString()
     .padStart(2, "0");
-  return `${m}:${s}.${ms}`;
+
+  return `${minutes}:${seconds}.${milliseconds}`;
 };
+
+const formatDateLabel = (value?: string | null) => {
+  if (!value) return null;
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(value));
+};
+
+const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
 const getAudioExtension = (name: string) => name.split(".").pop()?.toLowerCase() ?? "";
 
 const isAudioFile = (file: File) => {
   if (file.type.startsWith("audio/")) return true;
 
-  return [
-    "aac",
-    "aiff",
-    "alac",
-    "flac",
-    "m4a",
-    "mp3",
-    "ogg",
-    "wav",
-    "wma",
-  ].includes(getAudioExtension(file.name));
+  return ["aac", "aiff", "alac", "flac", "m4a", "mp3", "ogg", "wav", "wma"].includes(getAudioExtension(file.name));
 };
 
 const parseFadeSeconds = (value: string) => {
@@ -83,16 +73,6 @@ const parseFadeSeconds = (value: string) => {
 
 const normalizeFadeInput = (value: string) => parseFadeSeconds(value).toFixed(1);
 
-const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
-
-const stripExtension = (name: string) => name.replace(/\.[^.]+$/, "");
-
-const slugify = (value: string) =>
-  value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "") || "segment";
-
 const getRegionDuration = (start: number, end: number) => Math.max(0, end - start);
 
 const createSegmentId = () =>
@@ -100,7 +80,7 @@ const createSegmentId = () =>
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
-const createSegment = (start: number, end: number): TrackSegment => ({
+const createSegment = (start: number, end: number): PersistedTrackSegment => ({
   id: createSegmentId(),
   start,
   end,
@@ -113,29 +93,40 @@ const getSuggestedSegmentWindow = (trackDuration: number, seedTime: number) => {
     return { start: 0, end: 0 };
   }
 
-  const maxStart = Math.max(0, trackDuration - Math.min(DEFAULT_SEGMENT_LENGTH, trackDuration));
+  const segmentLength = Math.min(DEFAULT_SEGMENT_LENGTH, trackDuration);
+  const maxStart = Math.max(0, trackDuration - segmentLength);
   const start = clamp(seedTime, 0, maxStart);
-  const end = Math.min(trackDuration, start + DEFAULT_SEGMENT_LENGTH);
+  const end = Math.min(trackDuration, start + segmentLength);
+
   return { start, end };
 };
 
-const buildSegmentStoragePath = (userId: string, item: QueueItem, segmentIndex: number) => {
-  const safeName = slugify(stripExtension(item.displayName));
-  return `${userId}/${item.sourceHash}__${safeName}__segment-${String(segmentIndex + 1).padStart(2, "0")}.mp3`;
-};
-
-const readManifestFromStorage = () => {
-  if (typeof window === "undefined") return {} as Record<string, UploadedManifestEntry>;
-
-  try {
-    const raw = window.localStorage.getItem(UPLOADED_SOURCE_MANIFEST_KEY);
-    if (!raw) return {};
-
-    const parsed = JSON.parse(raw) as Record<string, UploadedManifestEntry>;
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
+const normalizeSegmentsForDuration = (segments: PersistedTrackSegment[], trackDuration: number) => {
+  if (trackDuration <= 0) {
+    return [];
   }
+
+  const fallbackWindow = getSuggestedSegmentWindow(trackDuration, 0);
+  const baseSegments = segments.length ? segments : [createSegment(fallbackWindow.start, fallbackWindow.end)];
+  const minimumLength = Math.min(0.25, trackDuration);
+  const maxStart = Math.max(0, trackDuration - minimumLength);
+
+  return baseSegments.map((segment, index) => {
+    const fallbackWindow = getSuggestedSegmentWindow(trackDuration, index * DEFAULT_SEGMENT_LENGTH);
+    const start = clamp(Number.isFinite(segment.start) ? segment.start : fallbackWindow.start, 0, maxStart);
+    const minimumEnd = Math.min(trackDuration, start + minimumLength);
+    const defaultEnd = Math.min(trackDuration, start + DEFAULT_SEGMENT_LENGTH);
+    const end = clamp(Number.isFinite(segment.end) ? segment.end : defaultEnd, minimumEnd, trackDuration);
+
+    return {
+      ...segment,
+      id: segment.id || createSegmentId(),
+      start,
+      end: end > start ? end : fallbackWindow.end,
+      fadeInInput: segment.fadeInInput || DEFAULT_FADE_SECONDS,
+      fadeOutInput: segment.fadeOutInput || DEFAULT_FADE_SECONDS,
+    };
+  });
 };
 
 const getReadablePath = (file: File) => {
@@ -148,6 +139,19 @@ const hashFile = async (file: File) => {
   const digest = await crypto.subtle.digest("SHA-256", arrayBuffer);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 };
+
+const createDraftTrack = (file: File, sourceHash: string): PersistedEditorTrack => ({
+  id: `${sourceHash}-${file.lastModified}`,
+  file,
+  sourceHash,
+  displayName: stripExtension(file.name),
+  relativePath: getReadablePath(file),
+  addedAt: new Date().toISOString(),
+  activeSegmentId: null,
+  segments: [],
+  approvedAt: null,
+  segmentCount: null,
+});
 
 const createProcessedSegment = async ({
   file,
@@ -184,52 +188,50 @@ const createProcessedSegment = async ({
 
     const leftSource = audioBuffer.getChannelData(0).slice(startSample, endSample);
     const rightSource =
-      audioBuffer.numberOfChannels > 1
-        ? audioBuffer.getChannelData(1).slice(startSample, endSample)
-        : leftSource.slice();
+      audioBuffer.numberOfChannels > 1 ? audioBuffer.getChannelData(1).slice(startSample, endSample) : leftSource.slice();
 
     const fadeInSamples = clamp(Math.floor(fadeInSeconds * audioBuffer.sampleRate), 0, sampleCount);
     const fadeOutSamples = clamp(Math.floor(fadeOutSeconds * audioBuffer.sampleRate), 0, sampleCount);
 
-    for (let i = 0; i < sampleCount; i += 1) {
+    for (let index = 0; index < sampleCount; index += 1) {
       let gain = 1;
 
-      if (fadeInSamples > 0 && i < fadeInSamples) {
-        gain = Math.min(gain, fadeInSamples === 1 ? 1 : i / (fadeInSamples - 1));
+      if (fadeInSamples > 0 && index < fadeInSamples) {
+        gain = Math.min(gain, fadeInSamples === 1 ? 1 : index / (fadeInSamples - 1));
       }
 
-      if (fadeOutSamples > 0 && i >= sampleCount - fadeOutSamples) {
-        const fadeOutIndex = i - (sampleCount - fadeOutSamples);
+      if (fadeOutSamples > 0 && index >= sampleCount - fadeOutSamples) {
+        const fadeOutIndex = index - (sampleCount - fadeOutSamples);
         const fadeOutGain = fadeOutSamples === 1 ? 0 : 1 - fadeOutIndex / (fadeOutSamples - 1);
         gain = Math.min(gain, fadeOutGain);
       }
 
-      leftSource[i] *= gain;
-      rightSource[i] *= gain;
+      leftSource[index] *= gain;
+      rightSource[index] *= gain;
     }
 
     const lamejs = (window as Window & typeof globalThis & { lamejs?: any }).lamejs;
     if (!lamejs) {
-      throw new Error("MP3 encoder failed to load from CDN.");
+      throw new Error("MP3 encoder failed to load.");
     }
 
     const encoder = new lamejs.Mp3Encoder(2, audioBuffer.sampleRate, 128);
     const leftInt16 = new Int16Array(sampleCount);
     const rightInt16 = new Int16Array(sampleCount);
 
-    for (let i = 0; i < sampleCount; i += 1) {
-      const leftSample = clamp(leftSource[i], -1, 1);
-      const rightSample = clamp(rightSource[i], -1, 1);
-      leftInt16[i] = leftSample < 0 ? leftSample * 32768 : leftSample * 32767;
-      rightInt16[i] = rightSample < 0 ? rightSample * 32768 : rightSample * 32767;
+    for (let index = 0; index < sampleCount; index += 1) {
+      const leftSample = clamp(leftSource[index], -1, 1);
+      const rightSample = clamp(rightSource[index], -1, 1);
+      leftInt16[index] = leftSample < 0 ? leftSample * 32768 : leftSample * 32767;
+      rightInt16[index] = rightSample < 0 ? rightSample * 32768 : rightSample * 32767;
     }
 
-    const sampleBlockSize = 1152;
+    const blockSize = 1152;
     const mp3Data: ArrayBuffer[] = [];
 
-    for (let i = 0; i < leftInt16.length; i += sampleBlockSize) {
-      const leftChunk = leftInt16.subarray(i, i + sampleBlockSize);
-      const rightChunk = rightInt16.subarray(i, i + sampleBlockSize);
+    for (let index = 0; index < leftInt16.length; index += blockSize) {
+      const leftChunk = leftInt16.subarray(index, index + blockSize);
+      const rightChunk = rightInt16.subarray(index, index + blockSize);
       const mp3Buffer = encoder.encodeBuffer(leftChunk, rightChunk);
 
       if (mp3Buffer.length > 0) {
@@ -249,106 +251,77 @@ const createProcessedSegment = async ({
 };
 
 export default function EditorPage() {
-  const { user } = useAuth();
+  const { user, loading } = useAuth();
 
-  const [sourceQueue, setSourceQueue] = useState<QueueItem[]>([]);
-  const [segments, setSegments] = useState<TrackSegment[]>([]);
-  const [activeSegmentId, setActiveSegmentId] = useState<string | null>(null);
-  const [sessionUploads, setSessionUploads] = useState<SessionUpload[]>([]);
-  const [uploadedManifest, setUploadedManifest] = useState<Record<string, UploadedManifestEntry>>({});
+  const [queuedTracks, setQueuedTracks] = useState<PersistedEditorTrack[]>([]);
+  const [approvedTracks, setApprovedTracks] = useState<PersistedEditorTrack[]>([]);
+  const [approvedLibrary, setApprovedLibrary] = useState<ApprovedSource[]>([]);
+  const [selectedQueuedId, setSelectedQueuedId] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<StatusMessage>(null);
+  const [inventoryError, setInventoryError] = useState("");
+  const [draftSavedAt, setDraftSavedAt] = useState<string | null>(null);
+  const [isDraftHydrating, setIsDraftHydrating] = useState(true);
+  const [isInventoryLoading, setIsInventoryLoading] = useState(true);
   const [isQueueing, setIsQueueing] = useState(false);
-  const [isApproving, setIsApproving] = useState(false);
-  const [queueMessage, setQueueMessage] = useState("");
-  const [editorMessage, setEditorMessage] = useState("");
-  const [editorError, setEditorError] = useState("");
-
+  const [isSavingDraft, setIsSavingDraft] = useState(false);
+  const [isClearingDraft, setIsClearingDraft] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [approvingTrackId, setApprovingTrackId] = useState<string | null>(null);
+  const [duplicateLibraryHashes, setDuplicateLibraryHashes] = useState<string[]>([]);
+  const [recentQueuedIds, setRecentQueuedIds] = useState<string[]>([]);
+  const [activeDropLane, setActiveDropLane] = useState<DropLane>(null);
+  const [dragTrackId, setDragTrackId] = useState<string | null>(null);
 
-  const waveformRef = useRef<HTMLDivElement>(null);
-  const wavesurfer = useRef<WaveSurfer | null>(null);
-  const regions = useRef<any>(null);
-  const regionMapRef = useRef<Map<string, any>>(new Map());
-  const segmentsRef = useRef<TrackSegment[]>([]);
-  const activeSegmentIdRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
-  const uploadedHashesRef = useRef<Set<string>>(new Set());
+  const waveformRef = useRef<HTMLDivElement>(null);
+  const wavesurferRef = useRef<WaveSurfer | null>(null);
+  const regionsRef = useRef<any>(null);
+  const regionMapRef = useRef<Map<string, any>>(new Map());
+  const selectedTrackIdRef = useRef<string | null>(null);
+  const segmentsRef = useRef<PersistedTrackSegment[]>([]);
+  const activeSegmentIdRef = useRef<string | null>(null);
 
-  const currentItem = sourceQueue[0] ?? null;
-  const activeSegment = segments.find((segment) => segment.id === activeSegmentId) ?? segments[0] ?? null;
-  const orderedSegments = [...segments].sort((left, right) => left.start - right.start);
   const usesRemoteUpload =
     Boolean(user?.id) &&
     !process.env.NEXT_PUBLIC_SUPABASE_URL?.includes("placeholder") &&
     !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.includes("placeholder");
 
-  const persistManifest = (nextManifest: Record<string, UploadedManifestEntry>) => {
-    uploadedHashesRef.current = new Set(Object.keys(nextManifest));
-    setUploadedManifest(nextManifest);
+  const isInventorySyncing = usesRemoteUpload && isInventoryLoading;
 
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(UPLOADED_SOURCE_MANIFEST_KEY, JSON.stringify(nextManifest));
+  const selectedTrack = useMemo(
+    () => queuedTracks.find((track) => track.id === selectedQueuedId) ?? queuedTracks[0] ?? null,
+    [queuedTracks, selectedQueuedId],
+  );
+
+  const orderedSegments = useMemo(
+    () => [...(selectedTrack?.segments ?? [])].sort((left, right) => left.start - right.start),
+    [selectedTrack?.segments],
+  );
+
+  const activeSegment =
+    orderedSegments.find((segment) => segment.id === selectedTrack?.activeSegmentId) ?? orderedSegments[0] ?? null;
+
+  const librarySources = useMemo(() => {
+    const approvedHashes = new Set(approvedTracks.map((track) => track.sourceHash));
+    return approvedLibrary.filter((source) => !approvedHashes.has(source.sourceHash));
+  }, [approvedLibrary, approvedTracks]);
+
+  useEffect(() => {
+    if (selectedQueuedId && queuedTracks.some((track) => track.id === selectedQueuedId)) {
+      return;
     }
-  };
 
-  const mergeManifestEntries = (entries: UploadedManifestEntry[]) => {
-    if (!entries.length) return;
-
-    setUploadedManifest((previous) => {
-      const nextManifest = { ...previous };
-
-      for (const entry of entries) {
-        nextManifest[entry.hash] = {
-          ...nextManifest[entry.hash],
-          ...entry,
-        };
-      }
-
-      uploadedHashesRef.current = new Set(Object.keys(nextManifest));
-      if (typeof window !== "undefined") {
-        window.localStorage.setItem(UPLOADED_SOURCE_MANIFEST_KEY, JSON.stringify(nextManifest));
-      }
-
-      return nextManifest;
-    });
-  };
-
-  const applyRegionStyles = (selectedId: string | null) => {
-    for (const [segmentId, region] of regionMapRef.current.entries()) {
-      region.setOptions?.({
-        color: segmentId === selectedId ? "rgba(196, 160, 82, 0.24)" : "rgba(173, 84, 75, 0.22)",
-      });
-    }
-  };
-
-  const createWaveRegion = (segment: TrackSegment, plugin: any) => {
-    const region = plugin.addRegion({
-      id: segment.id,
-      start: segment.start,
-      end: segment.end,
-      color: segment.id === activeSegmentIdRef.current ? "rgba(196, 160, 82, 0.24)" : "rgba(173, 84, 75, 0.22)",
-      drag: true,
-      resize: true,
-    });
-
-    regionMapRef.current.set(segment.id, region);
-    return region;
-  };
+    setSelectedQueuedId(queuedTracks[0]?.id ?? null);
+  }, [queuedTracks, selectedQueuedId]);
 
   useEffect(() => {
-    segmentsRef.current = segments;
-  }, [segments]);
-
-  useEffect(() => {
-    activeSegmentIdRef.current = activeSegmentId;
-    applyRegionStyles(activeSegmentId);
-  }, [activeSegmentId]);
-
-  useEffect(() => {
-    persistManifest(readManifestFromStorage());
-  }, []);
+    selectedTrackIdRef.current = selectedTrack?.id ?? null;
+    segmentsRef.current = selectedTrack?.segments ?? [];
+    activeSegmentIdRef.current = selectedTrack?.activeSegmentId ?? selectedTrack?.segments[0]?.id ?? null;
+  }, [selectedTrack?.activeSegmentId, selectedTrack?.id, selectedTrack?.segments]);
 
   useEffect(() => {
     if (!folderInputRef.current) return;
@@ -358,51 +331,127 @@ export default function EditorPage() {
   }, []);
 
   useEffect(() => {
-    if (!usesRemoteUpload || !user?.id) return;
-
     let isCancelled = false;
 
-    const hydrateRemoteManifest = async () => {
-      const { data, error } = await supabase.storage.from("highlights").list(user.id, {
-        limit: 1000,
-        sortBy: { column: "name", order: "desc" },
-      });
+    const restoreDraft = async () => {
+      try {
+        const snapshot = await loadEditorDraftSnapshot();
 
-      if (isCancelled || error || !data?.length) return;
+        if (isCancelled || !snapshot) {
+          return;
+        }
 
-      const remoteEntries = data.flatMap<UploadedManifestEntry>((item) => {
-        const [hash, slugWithExtension] = item.name.split("__");
-        if (!hash) return [];
-
-        return [
-          {
-            hash,
-            sourceName: slugWithExtension ? stripExtension(slugWithExtension).replace(/-/g, " ") : item.name,
-            sourceSize: 0,
-            storagePath: `${user.id}/${item.name}`,
-            uploadedAt: item.created_at ?? new Date().toISOString(),
-          },
-        ];
-      });
-
-      mergeManifestEntries(remoteEntries);
+        setQueuedTracks(snapshot.queuedTracks ?? []);
+        setApprovedTracks(snapshot.approvedTracks ?? []);
+        setSelectedQueuedId(snapshot.selectedQueuedId ?? snapshot.queuedTracks[0]?.id ?? null);
+        setDraftSavedAt(snapshot.savedAt);
+        setStatusMessage({ tone: "info", text: "Draft restored." });
+      } catch {
+        if (!isCancelled) {
+          setStatusMessage({ tone: "error", text: "Draft storage is unavailable in this browser." });
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsDraftHydrating(false);
+        }
+      }
     };
 
-    void hydrateRemoteManifest();
+    void restoreDraft();
 
     return () => {
       isCancelled = true;
     };
-  }, [usesRemoteUpload, user?.id]);
+  }, []);
 
   useEffect(() => {
-    const file = currentItem?.file;
+    if (loading) return;
 
-    setSegments([]);
-    setActiveSegmentId(null);
-    segmentsRef.current = [];
-    activeSegmentIdRef.current = null;
+    if (!usesRemoteUpload || !user?.id) {
+      setApprovedLibrary([]);
+      setInventoryError("");
+      setIsInventoryLoading(false);
+      return;
+    }
+
+    let isCancelled = false;
+
+    const loadInventory = async () => {
+      setIsInventoryLoading(true);
+      setInventoryError("");
+
+      try {
+        const inventory = await fetchHighlightInventory(user.id);
+
+        if (!isCancelled) {
+          setApprovedLibrary(inventory.sources);
+        }
+      } catch (error) {
+        if (!isCancelled) {
+          setApprovedLibrary([]);
+          setInventoryError(error instanceof Error ? error.message : "Failed to load the approved library.");
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsInventoryLoading(false);
+        }
+      }
+    };
+
+    void loadInventory();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [loading, user?.id, usesRemoteUpload]);
+
+  const applyRegionStyles = (selectedId: string | null) => {
+    for (const [segmentId, region] of regionMapRef.current.entries()) {
+      region.setOptions?.({
+        color: segmentId === selectedId ? "rgba(211, 170, 78, 0.24)" : "rgba(127, 167, 217, 0.18)",
+      });
+    }
+  };
+
+  const updateQueuedTrack = (trackId: string, updater: (track: PersistedEditorTrack) => PersistedEditorTrack) => {
+    setQueuedTracks((currentTracks) =>
+      currentTracks.map((track) => (track.id === trackId ? updater(track) : track)),
+    );
+  };
+
+  const setTrackActiveSegment = (trackId: string, segmentId: string | null) => {
+    updateQueuedTrack(trackId, (track) => ({
+      ...track,
+      activeSegmentId: segmentId,
+    }));
+  };
+
+  const createWaveRegion = (segment: PersistedTrackSegment, plugin: any) => {
+    const region = plugin.addRegion({
+      id: segment.id,
+      start: segment.start,
+      end: segment.end,
+      drag: true,
+      resize: true,
+      color: segment.id === activeSegmentIdRef.current ? "rgba(211, 170, 78, 0.24)" : "rgba(127, 167, 217, 0.18)",
+    });
+
+    regionMapRef.current.set(segment.id, region);
+    return region;
+  };
+
+  useEffect(() => {
+    activeSegmentIdRef.current = selectedTrack?.activeSegmentId ?? null;
+    applyRegionStyles(selectedTrack?.activeSegmentId ?? null);
+  }, [selectedTrack?.activeSegmentId]);
+
+  useEffect(() => {
+    const file = selectedTrack?.file;
+
     regionMapRef.current.clear();
+    wavesurferRef.current?.destroy();
+    wavesurferRef.current = null;
+    regionsRef.current = null;
 
     if (!file || !waveformRef.current) {
       setIsPlaying(false);
@@ -414,282 +463,264 @@ export default function EditorPage() {
     setIsPlaying(false);
     setCurrentTime(0);
     setDuration(0);
-    setEditorError("");
 
     const objectUrl = URL.createObjectURL(file);
-    const ws = WaveSurfer.create({
+    const waveSurfer = WaveSurfer.create({
       container: waveformRef.current,
-      waveColor: "rgba(255, 255, 255, 0.18)",
-      progressColor: "#E8E0D4",
-      cursorColor: "#C4A052",
+      waveColor: "rgba(255, 255, 255, 0.16)",
+      progressColor: "#F2EADC",
+      cursorColor: "#D3AA4E",
       barWidth: 2,
       barGap: 1,
       barRadius: 1,
-      height: WAVEFORM_HEIGHT,
       normalize: true,
+      height: WAVEFORM_HEIGHT,
       url: objectUrl,
     });
 
-    const wsRegions = ws.registerPlugin(RegionsPlugin.create());
+    const waveRegions = waveSurfer.registerPlugin(RegionsPlugin.create());
 
-    ws.on("ready", (trackDuration) => {
+    waveSurfer.on("ready", (trackDuration) => {
+      const normalizedSegments = normalizeSegmentsForDuration(selectedTrack.segments, trackDuration);
+      const nextActiveSegmentId =
+        normalizedSegments.find((segment) => segment.id === selectedTrack.activeSegmentId)?.id ?? normalizedSegments[0]?.id ?? null;
+
+      updateQueuedTrack(selectedTrack.id, (track) => ({
+        ...track,
+        segments: normalizedSegments,
+        activeSegmentId: nextActiveSegmentId,
+      }));
+
+      segmentsRef.current = normalizedSegments;
+      activeSegmentIdRef.current = nextActiveSegmentId;
+
+      normalizedSegments.forEach((segment) => createWaveRegion(segment, waveRegions));
+      applyRegionStyles(nextActiveSegmentId);
+
+      const initialSegment = normalizedSegments.find((segment) => segment.id === nextActiveSegmentId) ?? normalizedSegments[0] ?? null;
+      if (initialSegment) {
+        waveSurfer.setTime(initialSegment.start);
+        setCurrentTime(initialSegment.start);
+      }
+
       setDuration(trackDuration);
-      const window = getSuggestedSegmentWindow(trackDuration, 0);
-      const initialSegment = createSegment(window.start, window.end);
-
-      setSegments([initialSegment]);
-      segmentsRef.current = [initialSegment];
-      setActiveSegmentId(initialSegment.id);
-      activeSegmentIdRef.current = initialSegment.id;
-      createWaveRegion(initialSegment, wsRegions);
-      applyRegionStyles(initialSegment.id);
     });
 
-    ws.on("audioprocess", (time) => {
+    waveSurfer.on("audioprocess", (time) => {
       setCurrentTime(time);
 
-      const currentSegments = segmentsRef.current;
-      const currentActiveId = activeSegmentIdRef.current;
-      const currentActiveSegment = currentSegments.find((segment) => segment.id === currentActiveId) ?? currentSegments[0];
+      const currentActiveSegment =
+        segmentsRef.current.find((segment) => segment.id === activeSegmentIdRef.current) ?? segmentsRef.current[0] ?? null;
 
       if (currentActiveSegment && time >= currentActiveSegment.end) {
-        ws.pause();
-        ws.setTime(currentActiveSegment.start);
+        waveSurfer.pause();
+        waveSurfer.setTime(currentActiveSegment.start);
         setCurrentTime(currentActiveSegment.start);
       }
     });
 
-    ws.on("interaction", () => {
-      setCurrentTime(ws.getCurrentTime());
+    waveSurfer.on("interaction", () => {
+      setCurrentTime(waveSurfer.getCurrentTime());
     });
 
-    ws.on("play", () => setIsPlaying(true));
-    ws.on("pause", () => setIsPlaying(false));
+    waveSurfer.on("play", () => setIsPlaying(true));
+    waveSurfer.on("pause", () => setIsPlaying(false));
 
-    wsRegions.on("region-clicked", (region: any, event?: Event) => {
+    waveRegions.on("region-clicked", (region: any, event?: Event) => {
       event?.stopPropagation?.();
-      setActiveSegmentId(region.id);
+
+      const trackId = selectedTrackIdRef.current;
+      if (!trackId) return;
+
+      setTrackActiveSegment(trackId, region.id);
       activeSegmentIdRef.current = region.id;
+      waveSurfer.setTime(region.start);
       setCurrentTime(region.start);
-      ws.setTime(region.start);
     });
 
-    wsRegions.on("region-updated", (region: any) => {
-      setSegments((currentSegments) =>
-        currentSegments.map((segment) =>
-          segment.id === region.id
-            ? {
-                ...segment,
-                start: region.start,
-                end: region.end,
-              }
-            : segment,
-        ),
+    waveRegions.on("region-updated", (region: any) => {
+      const trackId = selectedTrackIdRef.current;
+      if (!trackId) return;
+
+      const nextSegments = segmentsRef.current.map((segment) =>
+        segment.id === region.id
+          ? {
+              ...segment,
+              start: region.start,
+              end: region.end,
+            }
+          : segment,
       );
 
-      const currentActiveId = activeSegmentIdRef.current;
-      if (region.id === currentActiveId) {
+      segmentsRef.current = nextSegments;
+
+      updateQueuedTrack(trackId, (track) => ({
+        ...track,
+        segments: nextSegments,
+      }));
+
+      if (region.id === activeSegmentIdRef.current) {
+        waveSurfer.setTime(region.start);
         setCurrentTime(region.start);
-        ws.setTime(region.start);
       }
     });
 
-    wavesurfer.current = ws;
-    regions.current = wsRegions;
+    wavesurferRef.current = waveSurfer;
+    regionsRef.current = waveRegions;
 
     return () => {
-      wavesurfer.current = null;
-      regions.current = null;
       regionMapRef.current.clear();
-      ws.destroy();
+      wavesurferRef.current = null;
+      regionsRef.current = null;
+      waveSurfer.destroy();
       URL.revokeObjectURL(objectUrl);
     };
-  }, [currentItem]);
+  }, [selectedTrack?.id]);
 
   const handleFadeInputChange =
     (segmentId: string, key: "fadeInInput" | "fadeOutInput") => (event: ChangeEvent<HTMLInputElement>) => {
+      const trackId = selectedTrack?.id;
       const nextValue = event.target.value;
-      if (nextValue === "" || /^\d*\.?\d*$/.test(nextValue)) {
-        setSegments((currentSegments) =>
-          currentSegments.map((segment) => (segment.id === segmentId ? { ...segment, [key]: nextValue } : segment)),
-        );
-      }
-    };
 
-  const handleFadeBlur = (segmentId: string, key: "fadeInInput" | "fadeOutInput") => {
-    setSegments((currentSegments) =>
-      currentSegments.map((segment) =>
-        segment.id === segmentId ? { ...segment, [key]: normalizeFadeInput(segment[key]) } : segment,
-      ),
-    );
-  };
-
-  const handleQueueSelection = async (event: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.target.files ?? []).filter(isAudioFile);
-    event.target.value = "";
-
-    if (!files.length) {
-      setQueueMessage("No audio files were detected in that selection.");
-      return;
-    }
-
-    setIsQueueing(true);
-    setQueueMessage("");
-    setEditorError("");
-    setEditorMessage("");
-
-    try {
-      const existingHashes = new Set([...uploadedHashesRef.current, ...sourceQueue.map((item) => item.sourceHash)]);
-      const nextItems: QueueItem[] = [];
-      let duplicateCount = 0;
-
-      for (const file of files) {
-        const hash = await hashFile(file);
-        if (existingHashes.has(hash)) {
-          duplicateCount += 1;
-          continue;
-        }
-
-        existingHashes.add(hash);
-        nextItems.push({
-          id: `${hash}-${file.lastModified}`,
-          file,
-          sourceHash: hash,
-          displayName: file.name,
-          relativePath: getReadablePath(file),
-        });
-      }
-
-      if (!nextItems.length) {
-        setQueueMessage(
-          duplicateCount > 0
-            ? `Skipped ${duplicateCount} file${duplicateCount === 1 ? "" : "s"} that were already uploaded or already queued.`
-            : "Nothing new was added to the queue.",
-        );
+      if (!trackId || (nextValue !== "" && !/^\d*\.?\d*$/.test(nextValue))) {
         return;
       }
 
-      setSourceQueue((currentQueue) => [...currentQueue, ...nextItems]);
+      updateQueuedTrack(trackId, (track) => ({
+        ...track,
+        segments: track.segments.map((segment) => (segment.id === segmentId ? { ...segment, [key]: nextValue } : segment)),
+      }));
+    };
 
-      const addedCount = nextItems.length;
-      const duplicateSummary =
-        duplicateCount > 0
-          ? ` ${duplicateCount} duplicate${duplicateCount === 1 ? "" : "s"} skipped before queueing.`
-          : "";
-      setQueueMessage(`Queued ${addedCount} new track${addedCount === 1 ? "" : "s"}.${duplicateSummary}`);
-    } catch (error) {
-      console.error(error);
-      setEditorError("Failed to inspect the selected files.");
-    } finally {
-      setIsQueueing(false);
-    }
+  const handleFadeBlur = (segmentId: string, key: "fadeInInput" | "fadeOutInput") => {
+    const trackId = selectedTrack?.id;
+    if (!trackId) return;
+
+    updateQueuedTrack(trackId, (track) => ({
+      ...track,
+      segments: track.segments.map((segment) =>
+        segment.id === segmentId ? { ...segment, [key]: normalizeFadeInput(segment[key]) } : segment,
+      ),
+    }));
   };
 
   const focusSegment = (segmentId: string) => {
     const segment = segmentsRef.current.find((item) => item.id === segmentId);
-    if (!segment || !wavesurfer.current) return;
+    if (!segment || !wavesurferRef.current) return;
 
-    setActiveSegmentId(segmentId);
+    const trackId = selectedTrack?.id;
+    if (!trackId) return;
+
+    setTrackActiveSegment(trackId, segmentId);
     activeSegmentIdRef.current = segmentId;
+    wavesurferRef.current.setTime(segment.start);
     setCurrentTime(segment.start);
-    wavesurfer.current.setTime(segment.start);
   };
 
   const previewSegment = (segmentId: string) => {
     const segment = segmentsRef.current.find((item) => item.id === segmentId);
-    if (!segment || !wavesurfer.current) return;
+    if (!segment || !wavesurferRef.current) return;
 
-    setActiveSegmentId(segmentId);
+    const trackId = selectedTrack?.id;
+    if (!trackId) return;
+
+    setTrackActiveSegment(trackId, segmentId);
     activeSegmentIdRef.current = segmentId;
-    wavesurfer.current.pause();
-    wavesurfer.current.setTime(segment.start);
+    wavesurferRef.current.pause();
+    wavesurferRef.current.setTime(segment.start);
     setCurrentTime(segment.start);
-    wavesurfer.current.play();
+    wavesurferRef.current.play();
   };
 
   const addSegment = () => {
-    if (!regions.current || duration <= 0) return;
+    const trackId = selectedTrack?.id;
+    if (!trackId || !regionsRef.current || duration <= 0) return;
 
     const seedTime = activeSegment ? activeSegment.end : currentTime;
     const window = getSuggestedSegmentWindow(duration, seedTime);
     const nextSegment = createSegment(window.start, window.end);
 
-    setSegments((currentSegments) => [...currentSegments, nextSegment]);
     segmentsRef.current = [...segmentsRef.current, nextSegment];
-    setActiveSegmentId(nextSegment.id);
+
+    updateQueuedTrack(trackId, (track) => ({
+      ...track,
+      segments: [...track.segments, nextSegment],
+      activeSegmentId: nextSegment.id,
+    }));
+
     activeSegmentIdRef.current = nextSegment.id;
-    createWaveRegion(nextSegment, regions.current);
+    createWaveRegion(nextSegment, regionsRef.current);
     applyRegionStyles(nextSegment.id);
-    wavesurfer.current?.setTime(nextSegment.start);
+    wavesurferRef.current?.setTime(nextSegment.start);
     setCurrentTime(nextSegment.start);
-    setEditorMessage(`Added segment ${segmentsRef.current.length}. Tune its fades below.`);
   };
 
   const removeSegment = (segmentId: string) => {
+    const trackId = selectedTrack?.id;
+    if (!trackId) return;
+
     const nextSegments = segmentsRef.current.filter((segment) => segment.id !== segmentId);
+    const nextActiveSegmentId =
+      segmentId === activeSegmentIdRef.current ? nextSegments[0]?.id ?? null : activeSegmentIdRef.current;
+
     const region = regionMapRef.current.get(segmentId);
     region?.remove?.();
     regionMapRef.current.delete(segmentId);
 
-    setSegments(nextSegments);
     segmentsRef.current = nextSegments;
+    activeSegmentIdRef.current = nextActiveSegmentId;
 
-    if (activeSegmentIdRef.current === segmentId) {
-      const nextActiveSegment = nextSegments[0] ?? null;
-      const nextActiveId = nextActiveSegment?.id ?? null;
-      setActiveSegmentId(nextActiveId);
-      activeSegmentIdRef.current = nextActiveId;
-      applyRegionStyles(nextActiveId);
+    updateQueuedTrack(trackId, (track) => ({
+      ...track,
+      segments: nextSegments,
+      activeSegmentId: nextActiveSegmentId,
+    }));
 
-      if (nextActiveSegment && wavesurfer.current) {
-        wavesurfer.current.setTime(nextActiveSegment.start);
-        setCurrentTime(nextActiveSegment.start);
-      }
-    }
+    applyRegionStyles(nextActiveSegmentId);
 
-    if (nextSegments.length === 0) {
+    if (!nextSegments.length) {
+      wavesurferRef.current?.pause();
       setIsPlaying(false);
-      wavesurfer.current?.pause();
-    }
-  };
-
-  const registerUploadedSource = (item: QueueItem, storagePath: string | null, segmentCount: number) => {
-    const entry: UploadedManifestEntry = {
-      hash: item.sourceHash,
-      sourceName: item.displayName,
-      sourceSize: item.file.size,
-      storagePath,
-      uploadedAt: new Date().toISOString(),
-    };
-
-    mergeManifestEntries([entry]);
-    setSessionUploads((current) => [
-      {
-        id: item.id,
-        label: `${item.displayName} (${segmentCount} segment${segmentCount === 1 ? "" : "s"})`,
-        status: storagePath ? "uploaded" : "approved",
-        timestamp: entry.uploadedAt,
-      },
-      ...current,
-    ]);
-  };
-
-  const approveCurrentTrack = async () => {
-    if (!currentItem) return;
-
-    if (orderedSegments.length === 0) {
-      setEditorError("Add at least one segment before approving this track.");
       return;
     }
 
-    setIsApproving(true);
-    setEditorError("");
-    setEditorMessage("");
+    const nextActiveSegment = nextSegments.find((segment) => segment.id === nextActiveSegmentId) ?? nextSegments[0];
+    wavesurferRef.current?.setTime(nextActiveSegment.start);
+    setCurrentTime(nextActiveSegment.start);
+  };
+
+  const refreshInventory = async () => {
+    if (!usesRemoteUpload || !user?.id) {
+      return;
+    }
 
     try {
-      for (const [index, segment] of orderedSegments.entries()) {
+      const inventory = await fetchHighlightInventory(user.id);
+      setApprovedLibrary(inventory.sources);
+      setInventoryError("");
+    } catch (error) {
+      setInventoryError(error instanceof Error ? error.message : "Failed to refresh the approved library.");
+    }
+  };
+
+  const approveTrack = async (trackId: string) => {
+    const track = queuedTracks.find((item) => item.id === trackId);
+    if (!track) return;
+
+    const trackSegments = [...track.segments].sort((left, right) => left.start - right.start);
+    if (!trackSegments.length) {
+      setSelectedQueuedId(trackId);
+      setStatusMessage({ tone: "error", text: "Open the track, place a segment, then approve it." });
+      return;
+    }
+
+    setApprovingTrackId(trackId);
+    setStatusMessage(null);
+
+    try {
+      for (const [index, segment] of trackSegments.entries()) {
         const blob = await createProcessedSegment({
-          file: currentItem.file,
+          file: track.file,
           start: segment.start,
           end: segment.end,
           fadeInSeconds: parseFadeSeconds(segment.fadeInInput),
@@ -697,7 +728,7 @@ export default function EditorPage() {
         });
 
         if (usesRemoteUpload && user?.id) {
-          const storagePath = buildSegmentStoragePath(user.id, currentItem, index);
+          const storagePath = buildSegmentStoragePath(user.id, track.sourceHash, track.displayName, index);
           const { error } = await supabase.storage.from("highlights").upload(storagePath, blob, {
             contentType: "audio/mpeg",
             upsert: true,
@@ -709,50 +740,243 @@ export default function EditorPage() {
         }
       }
 
-      const manifestStoragePath =
-        usesRemoteUpload && user?.id ? `${user.id}/${currentItem.sourceHash}__${slugify(stripExtension(currentItem.displayName))}` : null;
+      const approvedAt = new Date().toISOString();
+      const nextApprovedTrack: PersistedEditorTrack = {
+        ...track,
+        approvedAt,
+        segmentCount: trackSegments.length,
+      };
 
-      registerUploadedSource(currentItem, manifestStoragePath, orderedSegments.length);
-      setSourceQueue((currentQueue) => currentQueue.slice(1));
-      setEditorMessage(
-        usesRemoteUpload && user?.id
-          ? `${currentItem.displayName} approved with ${orderedSegments.length} segment${orderedSegments.length === 1 ? "" : "s"} and uploaded.`
-          : `${currentItem.displayName} approved with ${orderedSegments.length} segment${orderedSegments.length === 1 ? "" : "s"} in local mode.`,
-      );
+      const remainingQueuedTracks = queuedTracks.filter((item) => item.id !== trackId);
+      setQueuedTracks(remainingQueuedTracks);
+      setSelectedQueuedId((current) => (current === trackId ? remainingQueuedTracks[0]?.id ?? null : current));
+      setApprovedTracks((current) => [nextApprovedTrack, ...current.filter((item) => item.id !== trackId)]);
+      setRecentQueuedIds((current) => current.filter((id) => id !== trackId));
+
+      if (usesRemoteUpload && user?.id) {
+        await refreshInventory();
+      }
+
+      setStatusMessage({
+        tone: "success",
+        text: `${track.displayName} approved with ${trackSegments.length} segment${trackSegments.length === 1 ? "" : "s"}.`,
+      });
     } catch (error) {
-      console.error(error);
-      setEditorError(error instanceof Error ? error.message : "Failed to process and upload this track.");
+      setStatusMessage({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to process and upload the selected track.",
+      });
     } finally {
-      setIsApproving(false);
+      setApprovingTrackId(null);
     }
   };
+
+  const handleQueueSelection = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []).filter(isAudioFile);
+    event.target.value = "";
+
+    if (!files.length) {
+      setStatusMessage({ tone: "info", text: "No audio files were detected in that selection." });
+      return;
+    }
+
+    setIsQueueing(true);
+    setStatusMessage(null);
+
+    try {
+      const queuedHashes = new Set(queuedTracks.map((track) => track.sourceHash));
+      const approvedHashes = new Set(approvedTracks.map((track) => track.sourceHash));
+      const libraryHashes = new Set(approvedLibrary.map((source) => source.sourceHash));
+      const nextTracks: PersistedEditorTrack[] = [];
+      const remoteDuplicates = new Set<string>();
+      let draftDuplicateCount = 0;
+
+      for (const file of files) {
+        const sourceHash = await hashFile(file);
+
+        if (libraryHashes.has(sourceHash)) {
+          remoteDuplicates.add(sourceHash);
+          continue;
+        }
+
+        if (queuedHashes.has(sourceHash) || approvedHashes.has(sourceHash)) {
+          draftDuplicateCount += 1;
+          continue;
+        }
+
+        queuedHashes.add(sourceHash);
+        nextTracks.push(createDraftTrack(file, sourceHash));
+      }
+
+      setDuplicateLibraryHashes(Array.from(remoteDuplicates));
+      setRecentQueuedIds(nextTracks.map((track) => track.id));
+
+      if (!nextTracks.length) {
+        const approvedDuplicateCount = remoteDuplicates.size;
+        const parts = [];
+
+        if (approvedDuplicateCount > 0) {
+          parts.push(`${approvedDuplicateCount} already in the approved library`);
+        }
+
+        if (draftDuplicateCount > 0) {
+          parts.push(`${draftDuplicateCount} already in this draft`);
+        }
+
+        setStatusMessage({
+          tone: "info",
+          text: parts.length ? `Nothing new was added. ${parts.join(". ")}.` : "Nothing new was added.",
+        });
+        return;
+      }
+
+      setQueuedTracks((current) => [...current, ...nextTracks]);
+      setSelectedQueuedId((current) => current ?? nextTracks[0]?.id ?? null);
+
+      const approvedDuplicateCount = remoteDuplicates.size;
+      const summaryParts = [`Queued ${nextTracks.length} new track${nextTracks.length === 1 ? "" : "s"}.`];
+
+      if (approvedDuplicateCount > 0) {
+        summaryParts.push(`${approvedDuplicateCount} already approved and skipped.`);
+      }
+
+      if (draftDuplicateCount > 0) {
+        summaryParts.push(`${draftDuplicateCount} already in this draft and skipped.`);
+      }
+
+      setStatusMessage({ tone: "success", text: summaryParts.join(" ") });
+    } catch {
+      setStatusMessage({ tone: "error", text: "Failed to inspect the selected files." });
+    } finally {
+      setIsQueueing(false);
+    }
+  };
+
+  const handleSaveDraft = async () => {
+    setIsSavingDraft(true);
+
+    try {
+      const savedAt = new Date().toISOString();
+      await saveEditorDraftSnapshot({
+        queuedTracks,
+        approvedTracks,
+        selectedQueuedId,
+        savedAt,
+      });
+
+      setDraftSavedAt(savedAt);
+      setStatusMessage({ tone: "success", text: "Draft saved." });
+    } catch {
+      setStatusMessage({ tone: "error", text: "Failed to save the current draft." });
+    } finally {
+      setIsSavingDraft(false);
+    }
+  };
+
+  const handleClearDraft = async () => {
+    setIsClearingDraft(true);
+
+    try {
+      await clearEditorDraftSnapshot();
+      setQueuedTracks([]);
+      setApprovedTracks([]);
+      setSelectedQueuedId(null);
+      setDuplicateLibraryHashes([]);
+      setRecentQueuedIds([]);
+      setDraftSavedAt(null);
+      setStatusMessage({ tone: "info", text: "Draft cleared." });
+    } catch {
+      setStatusMessage({ tone: "error", text: "Failed to clear the saved draft." });
+    } finally {
+      setIsClearingDraft(false);
+    }
+  };
+
+  const removeQueuedTrack = (trackId: string) => {
+    const remainingQueuedTracks = queuedTracks.filter((track) => track.id !== trackId);
+    setQueuedTracks(remainingQueuedTracks);
+    setSelectedQueuedId((current) => (current === trackId ? remainingQueuedTracks[0]?.id ?? null : current));
+    setRecentQueuedIds((current) => current.filter((id) => id !== trackId));
+  };
+
+  const dismissApprovedTrack = (trackId: string) => {
+    setApprovedTracks((current) => current.filter((track) => track.id !== trackId));
+  };
+
+  const beginTrackDrag = (trackId: string, lane: DragLane) => (event: DragEvent<HTMLDivElement>) => {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", JSON.stringify({ trackId, lane }));
+    setDragTrackId(trackId);
+  };
+
+  const clearDragState = () => {
+    setDragTrackId(null);
+    setActiveDropLane(null);
+  };
+
+  const readDraggedTrackId = (event: DragEvent<HTMLElement>) => {
+    if (dragTrackId) return dragTrackId;
+
+    try {
+      const payload = JSON.parse(event.dataTransfer.getData("text/plain")) as { trackId?: string };
+      return payload.trackId ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  const handleApprovedLaneDrop = (event: DragEvent<HTMLElement>) => {
+    event.preventDefault();
+
+    const nextTrackId = readDraggedTrackId(event);
+    clearDragState();
+
+    if (!nextTrackId) return;
+
+    const track = queuedTracks.find((item) => item.id === nextTrackId);
+    if (!track) return;
+
+    if (!track.segments.length) {
+      setSelectedQueuedId(track.id);
+      setStatusMessage({ tone: "info", text: "Track loaded. Review the segment, then approve it." });
+      return;
+    }
+
+    void approveTrack(track.id);
+  };
+
+  const handleLibraryLaneDrop = (event: DragEvent<HTMLElement>) => {
+    event.preventDefault();
+
+    clearDragState();
+  };
+
+  const inventoryCountLabel = isInventorySyncing ? "Syncing library" : `${librarySources.length} in library`;
 
   return (
     <>
       <Script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js" strategy="lazyOnload" />
 
-      <div className="space-y-12">
-        <div>
-          <Eyebrow title="WORKSPACE" count="AUDIO PROCESSING ONLINE" />
-          <h1 className="font-serif text-5xl text-text-main" style={{ fontFamily: "var(--font-glosa)" }}>
-            Audio Editor
-          </h1>
-        </div>
-
-        <div className="rounded-xl border border-border-light bg-bg-panel p-6 shadow-2xl">
-          <div className="flex flex-col gap-4 border-b border-border-light/50 pb-6 md:flex-row md:items-end md:justify-between">
-            <div className="space-y-2">
-              <Eyebrow title="SOURCE QUEUE" count={`${sourceQueue.length} waiting / ${Object.keys(uploadedManifest).length} already approved`} />
-              <p className="max-w-2xl font-mono text-[10px] uppercase tracking-wider text-text-dim">
-                Upload single files or whole folders. Duplicate songs are filtered before they enter the queue, including tracks approved in previous sessions on this browser.
-              </p>
+      <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
+        <section className="editor-surface shrink-0 rounded-[30px] px-4 py-4 sm:px-5">
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+            <div className="min-w-0">
+              <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-accent-red">Editor</div>
+              <div className="mt-1 flex flex-wrap items-center gap-2">
+                <h1 className="font-serif text-3xl text-text-main sm:text-4xl">Audio editor</h1>
+                {usesRemoteUpload ? <Badge variant="green">Online</Badge> : <Badge variant="dim">Local mode</Badge>}
+              </div>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <Badge variant="dim">{queuedTracks.length} queued</Badge>
+                <Badge variant="dim">{approvedTracks.length} approved</Badge>
+                <Badge variant="dim">{inventoryCountLabel}</Badge>
+                {draftSavedAt ? <Badge variant="blue">Saved {formatDateLabel(draftSavedAt)}</Badge> : null}
+              </div>
             </div>
 
-            <div className="flex flex-wrap gap-3">
+            <div className="flex flex-wrap items-center gap-2">
               <input
                 ref={fileInputRef}
-                id="audio-upload-files"
-                name="audio-upload-files"
                 type="file"
                 accept="audio/*"
                 multiple
@@ -761,8 +985,6 @@ export default function EditorPage() {
               />
               <input
                 ref={folderInputRef}
-                id="audio-upload-folder"
-                name="audio-upload-folder"
                 type="file"
                 accept="audio/*"
                 multiple
@@ -773,280 +995,455 @@ export default function EditorPage() {
               <button
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={isQueueing}
-                className="border border-border-light bg-bg-base px-4 py-2 font-sans text-[10px] uppercase tracking-widest text-text-main transition-colors hover:bg-white/5 disabled:cursor-not-allowed disabled:text-text-dim"
+                disabled={isQueueing || isInventorySyncing || isDraftHydrating}
+                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-4 py-2.5 text-sm text-text-main transition-colors hover:bg-white/[0.09] disabled:cursor-not-allowed disabled:text-text-dim"
               >
-                {isQueueing ? "INSPECTING..." : "ADD FILES"}
+                {isQueueing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                Add files
               </button>
               <button
                 type="button"
                 onClick={() => folderInputRef.current?.click()}
-                disabled={isQueueing}
-                className="border border-border-light bg-bg-base px-4 py-2 font-sans text-[10px] uppercase tracking-widest text-text-main transition-colors hover:bg-white/5 disabled:cursor-not-allowed disabled:text-text-dim"
+                disabled={isQueueing || isInventorySyncing || isDraftHydrating}
+                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-4 py-2.5 text-sm text-text-main transition-colors hover:bg-white/[0.09] disabled:cursor-not-allowed disabled:text-text-dim"
               >
-                {isQueueing ? "INSPECTING..." : "ADD FOLDER"}
+                <FolderOpen className="h-4 w-4" />
+                Add folder
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleSaveDraft()}
+                disabled={isSavingDraft || isDraftHydrating}
+                className="inline-flex items-center gap-2 rounded-full border border-accent-blue/20 bg-accent-blue/10 px-4 py-2.5 text-sm text-accent-blue transition-colors hover:bg-accent-blue/16 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-text-dim"
+              >
+                {isSavingDraft ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                Save draft
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleClearDraft()}
+                disabled={isClearingDraft}
+                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2.5 text-sm text-text-dim transition-colors hover:bg-white/[0.06] hover:text-text-main disabled:cursor-not-allowed"
+              >
+                {isClearingDraft ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                Clear draft
               </button>
             </div>
           </div>
 
-          {queueMessage && (
-            <div className="mt-4 rounded border border-accent-gold/20 bg-accent-gold/10 px-3 py-2 font-mono text-[10px] uppercase tracking-wider text-accent-gold">
-              {queueMessage}
+          {statusMessage ? (
+            <div
+              className={cn(
+                "mt-4 rounded-[22px] border px-4 py-3 font-sans text-sm",
+                statusMessage.tone === "error" && "border-accent-red/25 bg-accent-red/12 text-accent-red",
+                statusMessage.tone === "success" && "border-accent-green/20 bg-accent-green/12 text-accent-green",
+                statusMessage.tone === "info" && "border-white/10 bg-white/[0.04] text-text-soft",
+              )}
+            >
+              {statusMessage.text}
             </div>
-          )}
+          ) : null}
+        </section>
 
-          {!currentItem ? (
-            <div className="mt-6 border border-dashed border-border-dashed bg-bg-panel p-12 text-center">
-              <span className="font-mono text-sm text-text-dim">[ AWAITING_AUDIO_QUEUE ]</span>
-            </div>
-          ) : (
-            <div className="mt-6 space-y-6">
-              <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-                <div>
-                  <Eyebrow title="INSPECTOR" count={currentItem.displayName} />
-                  <div className="font-mono text-[10px] uppercase tracking-wider text-text-dim">{currentItem.relativePath}</div>
-                </div>
-
-                <div className="flex items-center gap-3">
-                  <div className="font-mono text-xs text-text-dim">
-                    {formatTime(currentTime)} <span className="text-border-dashed">/</span> {formatTime(duration)}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={addSegment}
-                    disabled={isApproving || duration <= 0}
-                    className="border border-accent-gold/30 bg-accent-gold/10 px-3 py-2 font-sans text-[10px] uppercase tracking-widest text-accent-gold transition-colors hover:bg-accent-gold/20 disabled:cursor-not-allowed disabled:border-border-light disabled:bg-bg-base disabled:text-text-dim"
-                  >
-                    ADD SEGMENT
-                  </button>
-                </div>
-              </div>
-
-              <div className="rounded border border-border-light bg-bg-inspector p-4">
-                <div className="relative overflow-hidden rounded" style={{ height: `${WAVEFORM_HEIGHT}px` }}>
-                  <div ref={waveformRef} className="relative z-10 h-full w-full" />
-
-                  {duration > 0 && orderedSegments.length > 0 && (
-                    <div className="pointer-events-none absolute inset-0 z-30">
-                      {orderedSegments.map((segment) => {
-                        const segmentDuration = getRegionDuration(segment.start, segment.end);
-                        const fadeInDuration = Math.min(parseFadeSeconds(segment.fadeInInput), segmentDuration);
-                        const fadeOutDuration = Math.min(parseFadeSeconds(segment.fadeOutInput), segmentDuration);
-                        const isActive = segment.id === activeSegment?.id;
-
-                        return (
-                          <div
-                            key={segment.id}
-                            className="absolute inset-y-1"
-                            style={{
-                              left: `${(segment.start / duration) * 100}%`,
-                              width: `${(segmentDuration / duration) * 100}%`,
-                            }}
-                          >
-                            <div
-                              className={`absolute inset-0 rounded-sm border ${
-                                isActive ? "border-accent-gold/90 bg-accent-gold/8" : "border-accent-red/60 bg-accent-red/8"
-                              }`}
-                            />
-
-                            {fadeInDuration > 0 && (
-                              <div
-                                className="absolute inset-y-0 left-0 rounded-l-sm border-l border-accent-gold"
-                                style={{
-                                  width: `${(fadeInDuration / segmentDuration) * 100}%`,
-                                  backgroundImage:
-                                    "repeating-linear-gradient(135deg, rgba(196,160,82,0.55) 0px, rgba(196,160,82,0.55) 8px, rgba(196,160,82,0.18) 8px, rgba(196,160,82,0.18) 16px), linear-gradient(to right, rgba(196,160,82,0.45), rgba(196,160,82,0))",
-                                }}
-                              />
-                            )}
-
-                            {fadeOutDuration > 0 && (
-                              <div
-                                className="absolute inset-y-0 right-0 rounded-r-sm border-r border-accent-gold"
-                                style={{
-                                  width: `${(fadeOutDuration / segmentDuration) * 100}%`,
-                                  backgroundImage:
-                                    "repeating-linear-gradient(225deg, rgba(196,160,82,0.55) 0px, rgba(196,160,82,0.55) 8px, rgba(196,160,82,0.18) 8px, rgba(196,160,82,0.18) 16px), linear-gradient(to left, rgba(196,160,82,0.45), rgba(196,160,82,0))",
-                                }}
-                              />
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
+        <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(250px,1fr)_minmax(250px,1fr)]">
+          <div className="grid min-h-0 gap-4 xl:grid-rows-[minmax(240px,0.95fr)_minmax(0,1.05fr)]">
+            <section className="editor-surface flex min-h-0 flex-col rounded-[30px] p-4 sm:p-5">
+              <div className="flex items-start justify-between gap-4 border-b border-white/10 pb-4">
+                <div className="min-w-0">
+                  <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">Inspector</div>
+                  {selectedTrack ? (
+                    <>
+                      <div className="mt-2 truncate font-serif text-2xl text-text-main">{selectedTrack.displayName}</div>
+                      <div className="mt-1 truncate font-sans text-sm text-text-dim">{selectedTrack.relativePath}</div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="mt-2 font-serif text-2xl text-text-main">No track selected</div>
+                      <div className="mt-1 font-sans text-sm text-text-dim">Add audio to start shaping segments.</div>
+                    </>
                   )}
                 </div>
+
+                <div className="flex shrink-0 flex-wrap items-center gap-2">
+                  <Badge variant="dim">
+                    {selectedTrack ? `${orderedSegments.length} segment${orderedSegments.length === 1 ? "" : "s"}` : "Awaiting queue"}
+                  </Badge>
+                  <Badge variant="dim">
+                    {formatTime(currentTime)} / {formatTime(duration)}
+                  </Badge>
+                </div>
               </div>
 
-              {(editorError || editorMessage) && (
-                <div
-                  className={`rounded border px-3 py-2 font-mono text-[10px] uppercase tracking-wider ${
-                    editorError
-                      ? "border-accent-red/20 bg-accent-red/10 text-accent-red"
-                      : "border-accent-green/20 bg-accent-green/10 text-accent-green"
-                  }`}
-                >
-                  {editorError || editorMessage}
+              {!selectedTrack ? (
+                <div className="flex min-h-0 flex-1 items-center justify-center rounded-[26px] border border-dashed border-white/10 bg-white/[0.03] px-6 py-8 text-center font-sans text-sm text-text-dim">
+                  {isInventorySyncing ? "Syncing approved library before queueing new files." : "No queued tracks yet."}
+                </div>
+              ) : (
+                <div className="mt-4 grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
+                  <div className="min-h-0 rounded-[26px] border border-white/10 bg-black/18 p-3">
+                    <div className="relative overflow-hidden rounded-[18px]" style={{ height: `${WAVEFORM_HEIGHT}px` }}>
+                      <div ref={waveformRef} className="relative z-10 h-full w-full" />
+
+                      {duration > 0 && orderedSegments.length > 0 ? (
+                        <div className="pointer-events-none absolute inset-0 z-30">
+                          {orderedSegments.map((segment) => {
+                            const segmentDuration = getRegionDuration(segment.start, segment.end);
+                            const fadeInDuration = Math.min(parseFadeSeconds(segment.fadeInInput), segmentDuration);
+                            const fadeOutDuration = Math.min(parseFadeSeconds(segment.fadeOutInput), segmentDuration);
+                            const isActive = segment.id === activeSegment?.id;
+
+                            return (
+                              <div
+                                key={segment.id}
+                                className="absolute inset-y-1"
+                                style={{
+                                  left: `${(segment.start / duration) * 100}%`,
+                                  width: `${(segmentDuration / duration) * 100}%`,
+                                }}
+                              >
+                                <div
+                                  className={cn(
+                                    "absolute inset-0 rounded-sm border",
+                                    isActive ? "border-accent-gold/80 bg-accent-gold/12" : "border-accent-blue/60 bg-accent-blue/10",
+                                  )}
+                                />
+
+                                {fadeInDuration > 0 ? (
+                                  <div
+                                    className="absolute inset-y-0 left-0 rounded-l-sm border-l border-accent-gold"
+                                    style={{
+                                      width: `${(fadeInDuration / segmentDuration) * 100}%`,
+                                      backgroundImage:
+                                        "repeating-linear-gradient(135deg, rgba(211,170,78,0.5) 0px, rgba(211,170,78,0.5) 8px, rgba(211,170,78,0.14) 8px, rgba(211,170,78,0.14) 16px), linear-gradient(to right, rgba(211,170,78,0.42), rgba(211,170,78,0))",
+                                    }}
+                                  />
+                                ) : null}
+
+                                {fadeOutDuration > 0 ? (
+                                  <div
+                                    className="absolute inset-y-0 right-0 rounded-r-sm border-r border-accent-gold"
+                                    style={{
+                                      width: `${(fadeOutDuration / segmentDuration) * 100}%`,
+                                      backgroundImage:
+                                        "repeating-linear-gradient(225deg, rgba(211,170,78,0.5) 0px, rgba(211,170,78,0.5) 8px, rgba(211,170,78,0.14) 8px, rgba(211,170,78,0.14) 16px), linear-gradient(to left, rgba(211,170,78,0.42), rgba(211,170,78,0))",
+                                    }}
+                                  />
+                                ) : null}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : null}
+                    </div>
+
+                    <div className="mt-3 flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={addSegment}
+                        disabled={duration <= 0}
+                        className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-4 py-2 text-sm text-text-main transition-colors hover:bg-white/[0.09] disabled:cursor-not-allowed disabled:text-text-dim"
+                      >
+                        <Waves className="h-4 w-4" />
+                        Add segment
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void approveTrack(selectedTrack.id)}
+                        disabled={approvingTrackId === selectedTrack.id || !orderedSegments.length}
+                        className="inline-flex items-center gap-2 rounded-full border border-accent-gold/28 bg-accent-gold/12 px-4 py-2 text-sm text-accent-gold transition-colors hover:bg-accent-gold/18 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-text-dim"
+                      >
+                        {approvingTrackId === selectedTrack.id ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Check className="h-4 w-4" />
+                        )}
+                        Approve selected
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="min-h-0 rounded-[26px] border border-white/10 bg-white/[0.03] p-3">
+                    <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-3">
+                      <div>
+                        <div className="font-sans text-sm text-text-main">Segments</div>
+                        <div className="font-sans text-xs text-text-dim">{orderedSegments.length} ready on this track</div>
+                      </div>
+                      {isPlaying ? <Badge variant="gold">Previewing</Badge> : null}
+                    </div>
+
+                    <div className="mt-3 min-h-0 max-h-full space-y-3 overflow-y-auto pr-1">
+                      {orderedSegments.length === 0 ? (
+                        <div className="rounded-[22px] border border-dashed border-white/10 bg-white/[0.03] px-4 py-6 text-center font-sans text-sm text-text-dim">
+                          No segments yet.
+                        </div>
+                      ) : (
+                        orderedSegments.map((segment, index) => {
+                          const segmentDuration = getRegionDuration(segment.start, segment.end);
+                          const isActive = segment.id === activeSegment?.id;
+
+                          return (
+                            <div
+                              key={segment.id}
+                              className={cn(
+                                "rounded-[22px] border px-3 py-3 transition-colors",
+                                isActive ? "border-accent-gold/30 bg-accent-gold/10" : "border-white/10 bg-white/[0.03]",
+                              )}
+                            >
+                              <div className="flex items-center justify-between gap-3">
+                                <div>
+                                  <div className="font-sans text-sm text-text-main">Segment {String(index + 1).padStart(2, "0")}</div>
+                                  <div className="font-sans text-xs text-text-dim">
+                                    {formatTime(segment.start)} to {formatTime(segment.end)} · {formatTime(segmentDuration)}
+                                  </div>
+                                </div>
+                                {isActive ? <Badge variant="gold">Active</Badge> : null}
+                              </div>
+
+                              <div className="mt-3 flex flex-wrap gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => focusSegment(segment.id)}
+                                  className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-text-main transition-colors hover:bg-white/[0.08]"
+                                >
+                                  Focus
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => previewSegment(segment.id)}
+                                  className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-text-main transition-colors hover:bg-white/[0.08]"
+                                >
+                                  Preview
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => removeSegment(segment.id)}
+                                  className="rounded-full border border-accent-red/20 bg-accent-red/10 px-3 py-1.5 text-xs text-accent-red transition-colors hover:bg-accent-red/16"
+                                >
+                                  Remove
+                                </button>
+                              </div>
+
+                              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                                <label className="block">
+                                  <div className="mb-1 font-sans text-xs text-text-dim">Fade in</div>
+                                  <input
+                                    inputMode="decimal"
+                                    value={segment.fadeInInput}
+                                    onChange={handleFadeInputChange(segment.id, "fadeInInput")}
+                                    onBlur={() => handleFadeBlur(segment.id, "fadeInInput")}
+                                    className="w-full rounded-2xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-text-main outline-none transition-colors focus:border-accent-gold/35"
+                                  />
+                                </label>
+                                <label className="block">
+                                  <div className="mb-1 font-sans text-xs text-text-dim">Fade out</div>
+                                  <input
+                                    inputMode="decimal"
+                                    value={segment.fadeOutInput}
+                                    onChange={handleFadeInputChange(segment.id, "fadeOutInput")}
+                                    onBlur={() => handleFadeBlur(segment.id, "fadeOutInput")}
+                                    className="w-full rounded-2xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-text-main outline-none transition-colors focus:border-accent-gold/35"
+                                  />
+                                </label>
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
                 </div>
               )}
+            </section>
 
-              <div className="space-y-4 border-t border-border-light/50 pt-4">
-                <div className="flex items-center justify-between">
-                  <Eyebrow title="SEGMENTS" count={`${orderedSegments.length} prepared from this song`} />
+            <section className="editor-surface flex min-h-0 flex-col rounded-[30px] p-4 sm:p-5">
+              <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-4">
+                <div>
+                  <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">Queue</div>
+                  <div className="mt-2 font-sans text-lg text-text-main">{queuedTracks.length} waiting</div>
                 </div>
+                {recentQueuedIds.length ? <Badge variant="blue">{recentQueuedIds.length} new</Badge> : null}
+              </div>
 
-                {orderedSegments.length > 0 ? (
-                  <div className="grid gap-4">
-                    {orderedSegments.map((segment, index) => {
-                      const segmentDuration = getRegionDuration(segment.start, segment.end);
-                      const isActive = segment.id === activeSegment?.id;
+              <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
+                {queuedTracks.length === 0 ? (
+                  <div className="flex h-full items-center justify-center rounded-[24px] border border-dashed border-white/10 bg-white/[0.03] px-4 py-6 text-center font-sans text-sm text-text-dim">
+                    No queued tracks.
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {queuedTracks.map((track) => {
+                      const isSelected = selectedTrack?.id === track.id;
 
                       return (
-                        <div
-                          key={segment.id}
-                          className={`rounded-md border px-4 py-4 transition-colors ${
-                            isActive ? "border-accent-gold/60 bg-accent-gold/10" : "border-border-light bg-bg-base/50"
-                          }`}
-                        >
-                          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-                            <div className="space-y-2">
-                              <div className="flex items-center gap-3">
-                                <span className="font-sans text-sm uppercase tracking-[0.15em] text-text-main">
-                                  Segment {String(index + 1).padStart(2, "0")}
-                                </span>
-                                <Badge variant={isActive ? "gold" : "dim"}>{isActive ? "ACTIVE" : "READY"}</Badge>
-                              </div>
-                              <div className="font-mono text-[10px] uppercase tracking-wider text-text-dim">
-                                {formatTime(segment.start)} <span className="text-border-dashed">to</span> {formatTime(segment.end)}{" "}
-                                <span className="text-border-dashed">/</span> {formatTime(segmentDuration)}
-                              </div>
-                            </div>
-
-                            <div className="flex flex-wrap gap-3">
-                              <button
-                                type="button"
-                                onClick={() => focusSegment(segment.id)}
-                                className="border border-border-light bg-bg-panel px-3 py-2 font-sans text-[10px] uppercase tracking-widest text-text-main transition-colors hover:bg-white/5"
-                              >
-                                FOCUS
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => previewSegment(segment.id)}
-                                className="border border-border-light bg-bg-panel px-3 py-2 font-sans text-[10px] uppercase tracking-widest text-text-main transition-colors hover:bg-white/5"
-                              >
-                                {isActive && isPlaying ? "RESET" : "PLAY PREVIEW"}
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => removeSegment(segment.id)}
-                                disabled={isApproving}
-                                className="border border-accent-red/30 bg-accent-red/10 px-3 py-2 font-sans text-[10px] uppercase tracking-widest text-accent-red transition-colors hover:bg-accent-red/20 disabled:cursor-not-allowed disabled:border-border-light disabled:bg-bg-base disabled:text-text-dim"
-                              >
-                                REMOVE
-                              </button>
-                            </div>
-                          </div>
-
-                          <div className="mt-4 flex flex-wrap gap-6">
-                            <div className="flex flex-col space-y-1">
-                              <label htmlFor={`fade-in-${segment.id}`} className="font-sans text-[10px] uppercase text-text-dim">
-                                Fade In (s)
-                              </label>
-                              <input
-                                id={`fade-in-${segment.id}`}
-                                name={`fade-in-${segment.id}`}
-                                inputMode="decimal"
-                                value={segment.fadeInInput}
-                                onChange={handleFadeInputChange(segment.id, "fadeInInput")}
-                                onBlur={() => handleFadeBlur(segment.id, "fadeInInput")}
-                                className="w-24 border-b border-border-light bg-transparent font-mono text-accent-gold outline-none"
-                              />
-                            </div>
-
-                            <div className="flex flex-col space-y-1">
-                              <label htmlFor={`fade-out-${segment.id}`} className="font-sans text-[10px] uppercase text-text-dim">
-                                Fade Out (s)
-                              </label>
-                              <input
-                                id={`fade-out-${segment.id}`}
-                                name={`fade-out-${segment.id}`}
-                                inputMode="decimal"
-                                value={segment.fadeOutInput}
-                                onChange={handleFadeInputChange(segment.id, "fadeOutInput")}
-                                onBlur={() => handleFadeBlur(segment.id, "fadeOutInput")}
-                                className="w-24 border-b border-border-light bg-transparent font-mono text-accent-gold outline-none"
-                              />
-                            </div>
-                          </div>
-                        </div>
+                        <EditorTrackCard
+                          key={track.id}
+                          title={track.displayName}
+                          subtitle={track.relativePath}
+                          meta={
+                            track.segments.length
+                              ? `${track.segments.length} segment${track.segments.length === 1 ? "" : "s"} ready`
+                              : "Open to place the first segment"
+                          }
+                          badgeLabel={
+                            isSelected ? "Editing" : recentQueuedIds.includes(track.id) ? "New" : track.segments.length ? "Ready" : "Queued"
+                          }
+                          badgeVariant={isSelected ? "gold" : recentQueuedIds.includes(track.id) ? "blue" : track.segments.length ? "green" : "dim"}
+                          isSelected={isSelected}
+                          draggable
+                          onClick={() => setSelectedQueuedId(track.id)}
+                          onDragStart={beginTrackDrag(track.id, "queued")}
+                          onDragEnd={clearDragState}
+                          actionNode={
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                removeQueuedTrack(track.id);
+                              }}
+                              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-white/10 bg-white/[0.04] text-text-dim transition-colors hover:bg-accent-red/12 hover:text-accent-red"
+                              aria-label={`Remove ${track.displayName}`}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                          }
+                        />
                       );
                     })}
                   </div>
-                ) : (
-                  <div className="rounded-md border border-border-light bg-bg-panel px-4 py-6 font-mono text-[10px] uppercase tracking-wider text-text-dim">
-                    No segments are defined yet. Add one from the waveform.
-                  </div>
                 )}
-
-                <div className="flex justify-end">
-                  <button
-                    type="button"
-                    onClick={approveCurrentTrack}
-                    disabled={isApproving || orderedSegments.length === 0}
-                    className={`px-4 py-2 font-sans text-[10px] uppercase tracking-widest border transition-colors ${
-                      isApproving || orderedSegments.length === 0
-                        ? "cursor-not-allowed border-border-light bg-bg-panel text-text-dim"
-                        : "border-accent-red/30 bg-accent-red/10 text-accent-red hover:bg-accent-red/20"
-                    }`}
-                  >
-                    {isApproving ? "UPLOADING..." : `APPROVE & UPLOAD ${orderedSegments.length} SEGMENT${orderedSegments.length === 1 ? "" : "S"}`}
-                  </button>
-                </div>
               </div>
-            </div>
-          )}
-        </div>
-
-        {(sourceQueue.length > 0 || sessionUploads.length > 0) && (
-          <div className="grid gap-6 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)]">
-            <div className="space-y-4">
-              <Eyebrow title="UP NEXT" count={`${Math.max(sourceQueue.length - 1, 0)} remaining after current`} />
-              {sourceQueue.slice(1).length > 0 ? (
-                sourceQueue.slice(1, 7).map((item) => (
-                  <DataCard
-                    key={item.id}
-                    label={item.displayName}
-                    subtitle={item.relativePath}
-                    rightNode={<Badge variant="dim">QUEUED</Badge>}
-                  />
-                ))
-              ) : (
-                <div className="rounded-md border border-border-light bg-bg-panel px-4 py-6 font-mono text-[10px] uppercase tracking-wider text-text-dim">
-                  No additional tracks are waiting in the queue.
-                </div>
-              )}
-            </div>
-
-            <div className="space-y-4">
-              <Eyebrow title="SESSION LEDGER" count={`${sessionUploads.length} approved this session`} />
-              {sessionUploads.length > 0 ? (
-                sessionUploads.slice(0, 6).map((item) => (
-                  <DataCard
-                    key={item.id}
-                    label={item.label}
-                    subtitle={new Date(item.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                    rightNode={<Badge variant={item.status === "uploaded" ? "green" : "gold"}>{item.status.toUpperCase()}</Badge>}
-                  />
-                ))
-              ) : (
-                <div className="rounded-md border border-border-light bg-bg-panel px-4 py-6 font-mono text-[10px] uppercase tracking-wider text-text-dim">
-                  Approved tracks will appear here as you work through the queue.
-                </div>
-              )}
-            </div>
+            </section>
           </div>
-        )}
+
+          <section
+            className="editor-surface editor-drop-target flex min-h-0 flex-col rounded-[30px] p-4 sm:p-5"
+            data-drop-active={activeDropLane === "approved" ? "true" : "false"}
+            onDragOver={(event) => {
+              event.preventDefault();
+              setActiveDropLane("approved");
+            }}
+            onDrop={handleApprovedLaneDrop}
+            onDragLeave={() => {
+              if (activeDropLane === "approved") {
+                setActiveDropLane(null);
+              }
+            }}
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-4">
+              <div>
+                <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">Approved</div>
+                <div className="mt-2 font-sans text-lg text-text-main">{approvedTracks.length} this draft</div>
+              </div>
+              {approvingTrackId ? <Badge variant="gold">Approving</Badge> : null}
+            </div>
+
+            <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
+              {approvedTracks.length === 0 ? (
+                <div className="flex h-full items-center justify-center rounded-[24px] border border-dashed border-white/10 bg-white/[0.03] px-4 py-6 text-center font-sans text-sm text-text-dim">
+                  Drop a queued track here to approve it.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {approvedTracks.map((track) => (
+                    <EditorTrackCard
+                      key={track.id}
+                      title={track.displayName}
+                      subtitle={`${track.segmentCount ?? track.segments.length} segment${(track.segmentCount ?? track.segments.length) === 1 ? "" : "s"}`}
+                      meta={track.approvedAt ? `Approved ${formatDateLabel(track.approvedAt)}` : "Approved in this draft"}
+                      badgeLabel="Approved"
+                      badgeVariant="green"
+                      actionNode={
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            dismissApprovedTrack(track.id);
+                          }}
+                          className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-white/10 bg-white/[0.04] text-text-dim transition-colors hover:bg-white/[0.08] hover:text-text-main"
+                          aria-label={`Dismiss ${track.displayName}`}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      }
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          </section>
+
+          <section
+            className="editor-surface editor-drop-target flex min-h-0 flex-col rounded-[30px] p-4 sm:p-5"
+            data-drop-active={activeDropLane === "library" ? "true" : "false"}
+            onDragOver={(event) => {
+              event.preventDefault();
+              setActiveDropLane("library");
+            }}
+            onDrop={handleLibraryLaneDrop}
+            onDragLeave={() => {
+              if (activeDropLane === "library") {
+                setActiveDropLane(null);
+              }
+            }}
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-4">
+              <div>
+                <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">Approved library</div>
+                <div className="mt-2 font-sans text-lg text-text-main">{librarySources.length} already approved</div>
+              </div>
+              <Link
+                href="/reel"
+                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-3 py-2 text-sm text-text-main transition-colors hover:bg-white/[0.08]"
+              >
+                <Library className="h-4 w-4" />
+                Player
+              </Link>
+            </div>
+
+            {duplicateLibraryHashes.length ? (
+              <div className="mt-4 rounded-[22px] border border-accent-red/20 bg-accent-red/10 px-4 py-3 font-sans text-sm text-accent-red">
+                {duplicateLibraryHashes.length} reupload{duplicateLibraryHashes.length === 1 ? " was" : "s were"} already approved and skipped.
+              </div>
+            ) : null}
+
+            {inventoryError ? (
+              <div className="mt-4 rounded-[22px] border border-accent-red/20 bg-accent-red/10 px-4 py-3 font-sans text-sm text-accent-red">
+                {inventoryError}
+              </div>
+            ) : null}
+
+            <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
+              {isInventoryLoading ? (
+                <div className="flex h-full items-center justify-center gap-3 rounded-[24px] border border-dashed border-white/10 bg-white/[0.03] px-4 py-6 text-center font-sans text-sm text-text-dim">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Loading approved library…
+                </div>
+              ) : librarySources.length === 0 ? (
+                <div className="flex h-full items-center justify-center rounded-[24px] border border-dashed border-white/10 bg-white/[0.03] px-4 py-6 text-center font-sans text-sm text-text-dim">
+                  No approved sources yet.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {librarySources.map((source) => {
+                    const isDuplicate = duplicateLibraryHashes.includes(source.sourceHash);
+
+                    return (
+                      <EditorTrackCard
+                        key={source.sourceHash}
+                        title={source.sourceName}
+                        subtitle={`${source.segmentCount} segment${source.segmentCount === 1 ? "" : "s"}`}
+                        meta={source.uploadedAt ? `Approved ${formatDateLabel(source.uploadedAt)}` : "Approved earlier"}
+                        badgeLabel={isDuplicate ? "Duplicate" : "Library"}
+                        badgeVariant={isDuplicate ? "red" : "dim"}
+                        isDuplicate={isDuplicate}
+                      />
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </section>
+        </div>
       </div>
     </>
   );

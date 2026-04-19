@@ -1,33 +1,77 @@
 @import "tailwindcss";
 
+@theme inline {
+  --color-bg-base: var(--bg-base);
+  --color-bg-panel: var(--bg-panel);
+  --color-bg-panel-strong: var(--bg-panel-strong);
+  --color-bg-inspector: var(--bg-inspector);
+
+  --color-accent-gold: var(--accent-gold);
+  --color-accent-red: var(--accent-red);
+  --color-accent-green: var(--accent-green);
+  --color-accent-blue: var(--accent-blue);
+
+  --color-text-main: var(--text-main);
+  --color-text-dim: var(--text-dim);
+  --color-text-soft: var(--text-soft);
+
+  --color-border-light: var(--border-light);
+  --color-border-dashed: var(--border-dashed);
+
+  --font-sans: var(--font-slippery), sans-serif;
+  --font-serif: var(--font-glosa), serif;
+  --font-mono: var(--font-slippery), sans-serif;
+}
+
 @layer base {
   :root {
-    --bg-base: #111110;
-    --bg-panel: rgba(255, 255, 255, 0.02);
-    --bg-inspector: #151412;
+    --bg-base: #0d0d0e;
+    --bg-panel: rgba(255, 255, 255, 0.05);
+    --bg-panel-strong: rgba(255, 255, 255, 0.08);
+    --bg-inspector: #151517;
 
-    --accent-gold: #c4a052;
-    --accent-red: #ad544b;
-    --accent-green: rgb(79, 162, 121);
+    --accent-gold: #d3aa4e;
+    --accent-red: #d06d5b;
+    --accent-green: #67b98f;
+    --accent-blue: #7fa7d9;
 
-    --text-main: #e8e0d4;
-    --text-dim: #7a7873;
+    --text-main: #f2eadc;
+    --text-dim: #a6a097;
+    --text-soft: #cbc3b5;
 
-    --border-light: rgba(255, 255, 255, 0.06);
-    --border-dashed: rgba(255, 255, 255, 0.2);
+    --border-light: rgba(255, 255, 255, 0.09);
+    --border-dashed: rgba(255, 255, 255, 0.18);
 
-    --color-code-green: #6fcf97;
+    --color-code-green: #8ad8a9;
   }
 
-  html { color-scheme: dark; }
+  html {
+    color-scheme: dark;
+    scroll-behavior: smooth;
+  }
 
-  *, *::before, *::after { box-sizing: border-box; }
+  *, *::before, *::after {
+    box-sizing: border-box;
+  }
 
   body {
     min-height: 100dvh;
     background-color: var(--bg-base);
     color: var(--text-main);
     overflow-x: hidden;
+    font-family: var(--font-slippery), sans-serif;
+    background-image:
+      radial-gradient(circle at 20% 12%, rgba(127, 167, 217, 0.1), transparent 28%),
+      radial-gradient(circle at 80% 8%, rgba(211, 170, 78, 0.12), transparent 24%),
+      radial-gradient(circle at 50% 100%, rgba(208, 109, 91, 0.12), transparent 34%);
+  }
+
+  a,
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
   }
 }
 
@@ -37,9 +81,26 @@
 ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
 
 @keyframes grid-shift {
-  0% { transform: translateY(0); }
-  100% { transform: translateY(32px); }
+  0% { transform: translate3d(0, 0, 0); }
+  100% { transform: translate3d(0, 32px, 0); }
 }
 .animate-grid-shift {
-  animation: grid-shift 3s linear infinite;
+  animation: grid-shift 18s linear infinite;
+}
+
+.editor-surface {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.085), rgba(255, 255, 255, 0.03));
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 22px 90px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(24px);
+}
+
+.editor-drop-target {
+  transition: border-color 160ms ease, background-color 160ms ease, transform 160ms ease;
+}
+
+.editor-drop-target[data-drop-active="true"] {
+  border-color: rgba(211, 170, 78, 0.45);
+  background: rgba(211, 170, 78, 0.12);
+  transform: translateY(-2px);
 }

@@ -18,9 +18,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <Background />
         <AuthProvider>
           <AudioProvider>
-            <main className="relative z-10 flex min-h-screen flex-col items-center px-6 py-24">
-              <div className="w-full max-w-5xl">{children}</div>
-            </main>
+            <main className="relative z-10 min-h-screen">{children}</main>
           </AudioProvider>
         </AuthProvider>
       </body>

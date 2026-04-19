@@ -34,7 +34,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return (
-    <AuthCtx.Provider value={{ session, user, loading, signOut: async () => { await supabase.auth.signOut(); } }}>
+    <AuthCtx.Provider
+      value={{
+        session,
+        user,
+        loading,
+        signOut: async () => {
+          await supabase.auth.signOut();
+
+          if (typeof window !== "undefined") {
+            window.location.href = "/";
+          }
+        },
+      }}
+    >
       {children}
     </AuthCtx.Provider>
   );

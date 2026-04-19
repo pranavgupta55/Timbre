@@ -1,125 +1,130 @@
 "use client";
-import { useState } from "react";
-import { supabase } from "@/lib/supabase";
-import { useRouter } from "next/navigation";
-import { Eyebrow, DataCard } from "@/components/ui/TacticalUI";
 
-export default function Login() {
+import { useState, type FormEvent } from "react";
+import { useRouter } from "next/navigation";
+import { ArrowRight, Loader2 } from "lucide-react";
+import { supabase } from "@/lib/supabase";
+
+export default function LoginPage() {
   const [isSignUp, setIsSignUp] = useState(false);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [errorMsg, setErrorMsg] = useState("");
-  const [successMsg, setSuccessMsg] = useState("");
+  const [errorMessage, setErrorMessage] = useState("");
+  const [successMessage, setSuccessMessage] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const router = useRouter();
 
-  const handleAuth = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setErrorMsg("");
-    setSuccessMsg("");
-    
-    // DEV BYPASS: Allows you to view the app while using placeholder Supabase keys
-    if (process.env.NEXT_PUBLIC_SUPABASE_URL?.includes("placeholder")) {
-        router.push("/editor"); 
-        return;
-    }
+  const handleAuth = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setErrorMessage("");
+    setSuccessMessage("");
+    setIsSubmitting(true);
 
-    if (isSignUp) {
-      const { error } = await supabase.auth.signUp({ 
-        email, 
-        password,
-        options: { emailRedirectTo: window.location.origin }
-      });
-      if (error) {
-        setErrorMsg(error.message);
-      } else {
-        setSuccessMsg("System initialized. Check email to verify operator status.");
+    try {
+      if (process.env.NEXT_PUBLIC_SUPABASE_URL?.includes("placeholder")) {
+        router.push("/menu");
+        return;
       }
-    } else {
+
+      if (isSignUp) {
+        const { error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: { emailRedirectTo: window.location.origin },
+        });
+
+        if (error) {
+          setErrorMessage(error.message);
+          return;
+        }
+
+        setSuccessMessage("Check your email to finish creating the account.");
+        return;
+      }
+
       const { error } = await supabase.auth.signInWithPassword({ email, password });
       if (error) {
-        setErrorMsg(error.message);
-      } else {
-        router.push("/reel");
+        setErrorMessage(error.message);
+        return;
       }
+
+      router.push("/menu");
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
   return (
-    <div className="flex flex-col items-center justify-center min-h-[60vh]">
-      <div className="w-full max-w-md space-y-8">
-        <div>
-          <Eyebrow title={isSignUp ? "SYSTEM REGISTRATION" : "SYSTEM ACCESS"} />
-          <h1 className="font-serif text-5xl text-text-main" style={{ fontFamily: "var(--font-glosa)" }}>
-            {isSignUp ? "Initialize" : "Authentication"}
-          </h1>
+    <div className="flex min-h-dvh items-center justify-center px-4 py-10 sm:px-6">
+      <div className="editor-surface w-full max-w-[440px] rounded-[32px] p-6 sm:p-7">
+        <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-accent-red">
+          {isSignUp ? "Create account" : "Sign in"}
         </div>
-        
-        <form onSubmit={handleAuth} className="rounded-xl border border-border-light bg-bg-panel p-6 shadow-2xl backdrop-blur-md flex flex-col">
-          
-          <div className="space-y-4 mb-6">
-            <div className="space-y-1 flex flex-col">
-              <label htmlFor="auth-email" className="font-sans text-[10px] uppercase text-text-dim tracking-widest">
-                Operator Email
-              </label>
-              <input 
-                id="auth-email"
-                name="auth-email"
-                autoComplete="email"
-                type="email" 
-                value={email} 
-                onChange={e => setEmail(e.target.value)} 
-                className="w-full font-mono text-sm bg-bg-base border border-border-light px-3 py-2 text-text-main focus:border-accent-green focus:outline-none transition-colors" 
-                required 
-              />
-            </div>
-            
-            <div className="space-y-1 flex flex-col">
-              <label htmlFor="auth-password" className="font-sans text-[10px] uppercase text-text-dim tracking-widest">
-                Passcode
-              </label>
-              <input 
-                id="auth-password"
-                name="auth-password"
-                autoComplete={isSignUp ? "new-password" : "current-password"}
-                type="password" 
-                value={password} 
-                onChange={e => setPassword(e.target.value)} 
-                className="w-full font-mono text-sm bg-bg-base border border-border-light px-3 py-2 text-text-main focus:border-accent-green focus:outline-none transition-colors" 
-                required 
-              />
-            </div>
-          </div>
+        <h1 className="mt-2 font-serif text-3xl text-text-main sm:text-4xl">Timbre</h1>
+        <p className="mt-3 font-sans text-sm leading-6 text-text-dim">
+          {isSignUp ? "Create an account to save highlights and manage the library." : "Sign in to continue to the workspace."}
+        </p>
 
-          {errorMsg && (
-            <div className="text-accent-red font-mono text-[10px] uppercase tracking-wider mb-4 border border-accent-red/20 bg-accent-red/10 px-3 py-2 rounded">
-              {errorMsg}
+        <form onSubmit={handleAuth} className="mt-6 space-y-4">
+          <label className="block">
+            <div className="mb-1.5 font-sans text-xs text-text-dim">Email</div>
+            <input
+              id="auth-email"
+              autoComplete="email"
+              type="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              required
+              className="w-full rounded-[22px] border border-white/10 bg-black/20 px-4 py-3 text-sm text-text-main outline-none transition-colors focus:border-accent-gold/30"
+            />
+          </label>
+
+          <label className="block">
+            <div className="mb-1.5 font-sans text-xs text-text-dim">Password</div>
+            <input
+              id="auth-password"
+              autoComplete={isSignUp ? "new-password" : "current-password"}
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              required
+              className="w-full rounded-[22px] border border-white/10 bg-black/20 px-4 py-3 text-sm text-text-main outline-none transition-colors focus:border-accent-gold/30"
+            />
+          </label>
+
+          {errorMessage ? (
+            <div className="rounded-[20px] border border-accent-red/20 bg-accent-red/10 px-4 py-3 font-sans text-sm text-accent-red">
+              {errorMessage}
             </div>
-          )}
+          ) : null}
 
-          {successMsg && (
-            <div className="text-accent-green font-mono text-[10px] uppercase tracking-wider mb-4 border border-accent-green/20 bg-accent-green/10 px-3 py-2 rounded">
-              {successMsg}
+          {successMessage ? (
+            <div className="rounded-[20px] border border-accent-green/20 bg-accent-green/10 px-4 py-3 font-sans text-sm text-accent-green">
+              {successMessage}
             </div>
-          )}
+          ) : null}
 
-          <DataCard 
-            label={isSignUp ? "CREATE OPERATOR ACCOUNT" : "INITIALIZE LOGIN"} 
-            type="submit" 
-            state="default" 
-          />
-
-          <button 
-            type="button" 
-            onClick={() => {
-              setIsSignUp(!isSignUp);
-              setErrorMsg("");
-              setSuccessMsg("");
-            }} 
-            className="font-mono text-[10px] text-text-dim hover:text-text-main mt-5 text-center tracking-widest uppercase transition-colors"
+          <button
+            type="submit"
+            disabled={isSubmitting}
+            className="inline-flex w-full items-center justify-center gap-2 rounded-full border border-accent-gold/25 bg-accent-gold/12 px-4 py-3 text-sm text-accent-gold transition-colors hover:bg-accent-gold/18 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-text-dim"
           >
-            {isSignUp ? "[ ABORT: RETURN TO LOGIN ]" : "[ NO ACCOUNT? INITIATE REGISTRATION ]"}
+            {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}
+            {isSignUp ? "Create account" : "Continue"}
           </button>
         </form>
+
+        <button
+          type="button"
+          onClick={() => {
+            setIsSignUp((current) => !current);
+            setErrorMessage("");
+            setSuccessMessage("");
+          }}
+          className="mt-4 w-full text-center font-sans text-sm text-text-dim transition-colors hover:text-text-main"
+        >
+          {isSignUp ? "Back to sign in" : "Create an account"}
+        </button>
       </div>
     </div>
   );

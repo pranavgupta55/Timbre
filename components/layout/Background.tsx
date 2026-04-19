@@ -2,6 +2,13 @@ export function Background() {
   return (
     <div aria-hidden="true">
       <div className="fixed inset-0 -z-50 bg-bg-base" />
+
+      <div className="pointer-events-none fixed inset-0 -z-50 overflow-hidden">
+        <div className="absolute -left-20 top-10 h-80 w-80 rounded-full bg-accent-blue/10 blur-[120px]" />
+        <div className="absolute right-0 top-0 h-96 w-96 rounded-full bg-accent-gold/10 blur-[140px]" />
+        <div className="absolute bottom-0 left-1/3 h-[420px] w-[420px] rounded-full bg-accent-red/10 blur-[160px]" />
+      </div>
+
       <div className="fixed inset-0 -z-40 overflow-hidden pointer-events-none">
         <div
           className="absolute inset-[-100%] animate-grid-shift opacity-40"
@@ -10,7 +17,7 @@ export function Background() {
             backgroundSize: "32px 32px",
           }}
         />
-        <div className="absolute inset-0 bg-[radial-gradient(ellipse_80%_60%_at_50%_40%,transparent_0%,var(--bg-base)_100%)]" />
+        <div className="absolute inset-0 bg-[radial-gradient(ellipse_80%_60%_at_50%_35%,transparent_0%,var(--bg-base)_100%)]" />
       </div>
       <div
         className="pointer-events-none fixed inset-0 z-50 h-full w-full opacity-[0.06]"
