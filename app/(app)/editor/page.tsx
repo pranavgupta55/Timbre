@@ -1,14 +1,15 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import Script from "next/script";
 import WaveSurfer from "wavesurfer.js";
 import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
-import { Check, FolderOpen, Library, Loader2, Save, Trash2, Upload, Waves } from "lucide-react";
+import { Check, FolderOpen, Library, Loader2, Play, Save, Trash2, Upload, Waves } from "lucide-react";
 import { EditorTrackCard } from "@/components/editor/EditorTrackCard";
 import { Badge } from "@/components/ui/TacticalUI";
 import { useAuth } from "@/context/AuthContext";
+import { useEditorAudioDock, type EditorDockOverlay } from "@/context/EditorAudioDockContext";
 import {
   clearEditorDraftSnapshot,
   loadEditorDraftSnapshot,
@@ -28,6 +29,14 @@ type StatusTone = "info" | "success" | "error";
 type StatusMessage = { tone: StatusTone; text: string } | null;
 type DragLane = "queued";
 type DropLane = "approved" | "library" | null;
+type PlaybackMode = "source" | "final-preview";
+type ProcessedSegmentData = {
+  id: string;
+  left: Float32Array;
+  right: Float32Array;
+  sampleRate: number;
+  sampleCount: number;
+};
 
 const formatTime = (time: number) => {
   if (!Number.isFinite(time)) return "00:00.00";
@@ -153,22 +162,12 @@ const createDraftTrack = (file: File, sourceHash: string): PersistedEditorTrack 
   segmentCount: null,
 });
 
-const createProcessedSegment = async ({
-  file,
-  start,
-  end,
-  fadeInSeconds,
-  fadeOutSeconds,
-}: {
-  file: File;
-  start: number;
-  end: number;
-  fadeInSeconds: number;
-  fadeOutSeconds: number;
-}) => {
+const getAudioContextCtor = () =>
+  window.AudioContext || (window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
+const decodeAudioFile = async (file: File) => {
   const arrayBuffer = await file.arrayBuffer();
-  const AudioContextCtor =
-    window.AudioContext || (window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  const AudioContextCtor = getAudioContextCtor();
 
   if (!AudioContextCtor) {
     throw new Error("Audio processing is not supported in this browser.");
@@ -177,81 +176,211 @@ const createProcessedSegment = async ({
   const audioCtx = new AudioContextCtor();
 
   try {
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-    const startSample = Math.floor(start * audioBuffer.sampleRate);
-    const endSample = Math.floor(end * audioBuffer.sampleRate);
-    const sampleCount = Math.max(0, endSample - startSample);
-
-    if (sampleCount <= 0) {
-      throw new Error("Selected segment is empty.");
-    }
-
-    const leftSource = audioBuffer.getChannelData(0).slice(startSample, endSample);
-    const rightSource =
-      audioBuffer.numberOfChannels > 1 ? audioBuffer.getChannelData(1).slice(startSample, endSample) : leftSource.slice();
-
-    const fadeInSamples = clamp(Math.floor(fadeInSeconds * audioBuffer.sampleRate), 0, sampleCount);
-    const fadeOutSamples = clamp(Math.floor(fadeOutSeconds * audioBuffer.sampleRate), 0, sampleCount);
-
-    for (let index = 0; index < sampleCount; index += 1) {
-      let gain = 1;
-
-      if (fadeInSamples > 0 && index < fadeInSamples) {
-        gain = Math.min(gain, fadeInSamples === 1 ? 1 : index / (fadeInSamples - 1));
-      }
-
-      if (fadeOutSamples > 0 && index >= sampleCount - fadeOutSamples) {
-        const fadeOutIndex = index - (sampleCount - fadeOutSamples);
-        const fadeOutGain = fadeOutSamples === 1 ? 0 : 1 - fadeOutIndex / (fadeOutSamples - 1);
-        gain = Math.min(gain, fadeOutGain);
-      }
-
-      leftSource[index] *= gain;
-      rightSource[index] *= gain;
-    }
-
-    const lamejs = (window as Window & typeof globalThis & { lamejs?: any }).lamejs;
-    if (!lamejs) {
-      throw new Error("MP3 encoder failed to load.");
-    }
-
-    const encoder = new lamejs.Mp3Encoder(2, audioBuffer.sampleRate, 128);
-    const leftInt16 = new Int16Array(sampleCount);
-    const rightInt16 = new Int16Array(sampleCount);
-
-    for (let index = 0; index < sampleCount; index += 1) {
-      const leftSample = clamp(leftSource[index], -1, 1);
-      const rightSample = clamp(rightSource[index], -1, 1);
-      leftInt16[index] = leftSample < 0 ? leftSample * 32768 : leftSample * 32767;
-      rightInt16[index] = rightSample < 0 ? rightSample * 32768 : rightSample * 32767;
-    }
-
-    const blockSize = 1152;
-    const mp3Data: ArrayBuffer[] = [];
-
-    for (let index = 0; index < leftInt16.length; index += blockSize) {
-      const leftChunk = leftInt16.subarray(index, index + blockSize);
-      const rightChunk = rightInt16.subarray(index, index + blockSize);
-      const mp3Buffer = encoder.encodeBuffer(leftChunk, rightChunk);
-
-      if (mp3Buffer.length > 0) {
-        mp3Data.push(Uint8Array.from(mp3Buffer).buffer);
-      }
-    }
-
-    const finalBuffer = encoder.flush();
-    if (finalBuffer.length > 0) {
-      mp3Data.push(Uint8Array.from(finalBuffer).buffer);
-    }
-
-    return new Blob(mp3Data, { type: "audio/mpeg" });
+    return await audioCtx.decodeAudioData(arrayBuffer.slice(0));
   } finally {
     await audioCtx.close();
   }
 };
 
+const buildProcessedSegmentData = ({
+  segmentId,
+  audioBuffer,
+  start,
+  end,
+  fadeInSeconds,
+  fadeOutSeconds,
+}: {
+  segmentId: string;
+  audioBuffer: AudioBuffer;
+  start: number;
+  end: number;
+  fadeInSeconds: number;
+  fadeOutSeconds: number;
+}): ProcessedSegmentData => {
+  const startSample = Math.floor(start * audioBuffer.sampleRate);
+  const endSample = Math.floor(end * audioBuffer.sampleRate);
+  const sampleCount = Math.max(0, endSample - startSample);
+
+  if (sampleCount <= 0) {
+    throw new Error("Selected segment is empty.");
+  }
+
+  const left = Float32Array.from(audioBuffer.getChannelData(0).slice(startSample, endSample));
+  const right =
+    audioBuffer.numberOfChannels > 1
+      ? Float32Array.from(audioBuffer.getChannelData(1).slice(startSample, endSample))
+      : Float32Array.from(left);
+
+  const fadeInSamples = clamp(Math.floor(fadeInSeconds * audioBuffer.sampleRate), 0, sampleCount);
+  const fadeOutSamples = clamp(Math.floor(fadeOutSeconds * audioBuffer.sampleRate), 0, sampleCount);
+
+  for (let index = 0; index < sampleCount; index += 1) {
+    let gain = 1;
+
+    if (fadeInSamples > 0 && index < fadeInSamples) {
+      gain = Math.min(gain, fadeInSamples === 1 ? 1 : index / (fadeInSamples - 1));
+    }
+
+    if (fadeOutSamples > 0 && index >= sampleCount - fadeOutSamples) {
+      const fadeOutIndex = index - (sampleCount - fadeOutSamples);
+      const fadeOutGain = fadeOutSamples === 1 ? 0 : 1 - fadeOutIndex / (fadeOutSamples - 1);
+      gain = Math.min(gain, fadeOutGain);
+    }
+
+    left[index] *= gain;
+    right[index] *= gain;
+  }
+
+  return {
+    id: segmentId,
+    left,
+    right,
+    sampleRate: audioBuffer.sampleRate,
+    sampleCount,
+  };
+};
+
+const encodeMp3Segment = (segment: ProcessedSegmentData) => {
+  const lamejs = (window as Window & typeof globalThis & { lamejs?: any }).lamejs;
+  if (!lamejs) {
+    throw new Error("MP3 encoder failed to load.");
+  }
+
+  const encoder = new lamejs.Mp3Encoder(2, segment.sampleRate, 128);
+  const leftInt16 = new Int16Array(segment.sampleCount);
+  const rightInt16 = new Int16Array(segment.sampleCount);
+
+  for (let index = 0; index < segment.sampleCount; index += 1) {
+    const leftSample = clamp(segment.left[index], -1, 1);
+    const rightSample = clamp(segment.right[index], -1, 1);
+    leftInt16[index] = leftSample < 0 ? leftSample * 32768 : leftSample * 32767;
+    rightInt16[index] = rightSample < 0 ? rightSample * 32768 : rightSample * 32767;
+  }
+
+  const blockSize = 1152;
+  const mp3Data: ArrayBuffer[] = [];
+
+  for (let index = 0; index < leftInt16.length; index += blockSize) {
+    const leftChunk = leftInt16.subarray(index, index + blockSize);
+    const rightChunk = rightInt16.subarray(index, index + blockSize);
+    const mp3Buffer = encoder.encodeBuffer(leftChunk, rightChunk);
+
+    if (mp3Buffer.length > 0) {
+      mp3Data.push(Uint8Array.from(mp3Buffer).buffer);
+    }
+  }
+
+  const finalBuffer = encoder.flush();
+  if (finalBuffer.length > 0) {
+    mp3Data.push(Uint8Array.from(finalBuffer).buffer);
+  }
+
+  return new Blob(mp3Data, { type: "audio/mpeg" });
+};
+
+const createProcessedSegment = ({
+  audioBuffer,
+  segmentId,
+  start,
+  end,
+  fadeInSeconds,
+  fadeOutSeconds,
+}: {
+  audioBuffer: AudioBuffer;
+  segmentId: string;
+  start: number;
+  end: number;
+  fadeInSeconds: number;
+  fadeOutSeconds: number;
+}) =>
+  encodeMp3Segment(
+    buildProcessedSegmentData({
+      segmentId,
+      audioBuffer,
+      start,
+      end,
+      fadeInSeconds,
+      fadeOutSeconds,
+    }),
+  );
+
+const mergeProcessedSegments = (segments: ProcessedSegmentData[]) => {
+  if (!segments.length) {
+    throw new Error("Add a segment before playing the final preview.");
+  }
+
+  const sampleRate = segments[0].sampleRate;
+  const sampleCount = segments.reduce((total, segment) => total + segment.sampleCount, 0);
+  const left = new Float32Array(sampleCount);
+  const right = new Float32Array(sampleCount);
+  const overlays: EditorDockOverlay[] = [];
+
+  let offset = 0;
+  for (const segment of segments) {
+    left.set(segment.left, offset);
+    right.set(segment.right, offset);
+
+    const start = offset / sampleRate;
+    offset += segment.sampleCount;
+    overlays.push({
+      id: segment.id,
+      start,
+      end: offset / sampleRate,
+    });
+  }
+
+  return {
+    id: "final-preview",
+    left,
+    right,
+    sampleRate,
+    sampleCount,
+    overlays,
+  };
+};
+
+const writeWavLabel = (view: DataView, offset: number, text: string) => {
+  for (let index = 0; index < text.length; index += 1) {
+    view.setUint8(offset + index, text.charCodeAt(index));
+  }
+};
+
+const encodeWavPreview = (segment: ReturnType<typeof mergeProcessedSegments>) => {
+  const channelCount = 2;
+  const bytesPerSample = 2;
+  const blockAlign = channelCount * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + segment.sampleCount * blockAlign);
+  const view = new DataView(buffer);
+
+  writeWavLabel(view, 0, "RIFF");
+  view.setUint32(4, 36 + segment.sampleCount * blockAlign, true);
+  writeWavLabel(view, 8, "WAVE");
+  writeWavLabel(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channelCount, true);
+  view.setUint32(24, segment.sampleRate, true);
+  view.setUint32(28, segment.sampleRate * blockAlign, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bytesPerSample * 8, true);
+  writeWavLabel(view, 36, "data");
+  view.setUint32(40, segment.sampleCount * blockAlign, true);
+
+  let offset = 44;
+  for (let index = 0; index < segment.sampleCount; index += 1) {
+    const leftSample = clamp(segment.left[index], -1, 1);
+    const rightSample = clamp(segment.right[index], -1, 1);
+    view.setInt16(offset, leftSample < 0 ? leftSample * 32768 : leftSample * 32767, true);
+    view.setInt16(offset + 2, rightSample < 0 ? rightSample * 32768 : rightSample * 32767, true);
+    offset += blockAlign;
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+};
+
 export default function EditorPage() {
   const { user, loading } = useAuth();
+  const { setDockState } = useEditorAudioDock();
 
   const [queuedTracks, setQueuedTracks] = useState<PersistedEditorTrack[]>([]);
   const [approvedTracks, setApprovedTracks] = useState<PersistedEditorTrack[]>([]);
@@ -265,9 +394,17 @@ export default function EditorPage() {
   const [isQueueing, setIsQueueing] = useState(false);
   const [isSavingDraft, setIsSavingDraft] = useState(false);
   const [isClearingDraft, setIsClearingDraft] = useState(false);
+  const [playbackMode, setPlaybackMode] = useState<PlaybackMode>("source");
   const [isPlaying, setIsPlaying] = useState(false);
+  const [editorVolume, setEditorVolume] = useState(0.92);
+  const [isEditorMuted, setIsEditorMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [isFinalPreviewLoading, setIsFinalPreviewLoading] = useState(false);
+  const [isFinalPreviewPlaying, setIsFinalPreviewPlaying] = useState(false);
+  const [finalPreviewCurrentTime, setFinalPreviewCurrentTime] = useState(0);
+  const [finalPreviewDuration, setFinalPreviewDuration] = useState(0);
+  const [finalPreviewOverlays, setFinalPreviewOverlays] = useState<EditorDockOverlay[]>([]);
   const [approvingTrackId, setApprovingTrackId] = useState<string | null>(null);
   const [duplicateLibraryHashes, setDuplicateLibraryHashes] = useState<string[]>([]);
   const [recentQueuedIds, setRecentQueuedIds] = useState<string[]>([]);
@@ -283,6 +420,9 @@ export default function EditorPage() {
   const selectedTrackIdRef = useRef<string | null>(null);
   const segmentsRef = useRef<PersistedTrackSegment[]>([]);
   const activeSegmentIdRef = useRef<string | null>(null);
+  const previewSegmentEndRef = useRef<number | null>(null);
+  const finalPreviewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const finalPreviewUrlRef = useRef<string | null>(null);
 
   const usesRemoteUpload =
     Boolean(user?.id) &&
@@ -304,10 +444,18 @@ export default function EditorPage() {
   const activeSegment =
     orderedSegments.find((segment) => segment.id === selectedTrack?.activeSegmentId) ?? orderedSegments[0] ?? null;
 
+  const activeFinalPreviewOverlayId =
+    finalPreviewOverlays.find((overlay) => finalPreviewCurrentTime >= overlay.start && finalPreviewCurrentTime <= overlay.end)?.id ?? null;
+
+  const displayCurrentTime = playbackMode === "final-preview" ? finalPreviewCurrentTime : currentTime;
+  const displayDuration = playbackMode === "final-preview" ? finalPreviewDuration : duration;
+  const displayIsPlaying = playbackMode === "final-preview" ? isFinalPreviewPlaying : isPlaying;
+
   const librarySources = useMemo(() => {
+    const queuedHashes = new Set(queuedTracks.map((track) => track.sourceHash));
     const approvedHashes = new Set(approvedTracks.map((track) => track.sourceHash));
-    return approvedLibrary.filter((source) => !approvedHashes.has(source.sourceHash));
-  }, [approvedLibrary, approvedTracks]);
+    return approvedLibrary.filter((source) => !approvedHashes.has(source.sourceHash) && !queuedHashes.has(source.sourceHash));
+  }, [approvedLibrary, approvedTracks, queuedTracks]);
 
   useEffect(() => {
     if (selectedQueuedId && queuedTracks.some((track) => track.id === selectedQueuedId)) {
@@ -345,10 +493,10 @@ export default function EditorPage() {
         setApprovedTracks(snapshot.approvedTracks ?? []);
         setSelectedQueuedId(snapshot.selectedQueuedId ?? snapshot.queuedTracks[0]?.id ?? null);
         setDraftSavedAt(snapshot.savedAt);
-        setStatusMessage({ tone: "info", text: "Draft restored." });
+        setStatusMessage({ tone: "info", text: "Local draft restored." });
       } catch {
         if (!isCancelled) {
-          setStatusMessage({ tone: "error", text: "Draft storage is unavailable in this browser." });
+          setStatusMessage({ tone: "error", text: "Local drafts are unavailable in this browser." });
         }
       } finally {
         if (!isCancelled) {
@@ -419,11 +567,55 @@ export default function EditorPage() {
     );
   };
 
+  const resetFinalPreview = useCallback(() => {
+    const audio = finalPreviewAudioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.ontimeupdate = null;
+      audio.onloadedmetadata = null;
+      audio.onplay = null;
+      audio.onpause = null;
+      audio.onended = null;
+      audio.removeAttribute("src");
+      finalPreviewAudioRef.current = null;
+    }
+
+    if (finalPreviewUrlRef.current) {
+      URL.revokeObjectURL(finalPreviewUrlRef.current);
+      finalPreviewUrlRef.current = null;
+    }
+
+    setPlaybackMode("source");
+    setIsFinalPreviewLoading(false);
+    setIsFinalPreviewPlaying(false);
+    setFinalPreviewCurrentTime(0);
+    setFinalPreviewDuration(0);
+    setFinalPreviewOverlays([]);
+  }, []);
+
+  const clearSegmentPreview = () => {
+    previewSegmentEndRef.current = null;
+  };
+
   const setTrackActiveSegment = (trackId: string, segmentId: string | null) => {
     updateQueuedTrack(trackId, (track) => ({
       ...track,
       activeSegmentId: segmentId,
     }));
+  };
+
+  const syncActiveSegmentForTime = (time: number) => {
+    const trackId = selectedTrackIdRef.current;
+    if (!trackId) return;
+
+    const containingSegment = segmentsRef.current.find((segment) => time >= segment.start && time <= segment.end);
+    if (!containingSegment || containingSegment.id === activeSegmentIdRef.current) {
+      return;
+    }
+
+    activeSegmentIdRef.current = containingSegment.id;
+    setTrackActiveSegment(trackId, containingSegment.id);
+    applyRegionStyles(containingSegment.id);
   };
 
   const createWaveRegion = (segment: PersistedTrackSegment, plugin: any) => {
@@ -446,8 +638,13 @@ export default function EditorPage() {
   }, [selectedTrack?.activeSegmentId]);
 
   useEffect(() => {
+    resetFinalPreview();
+  }, [orderedSegments, resetFinalPreview, selectedTrack?.id]);
+
+  useEffect(() => {
     const file = selectedTrack?.file;
 
+    clearSegmentPreview();
     regionMapRef.current.clear();
     wavesurferRef.current?.destroy();
     wavesurferRef.current = null;
@@ -477,6 +674,7 @@ export default function EditorPage() {
       height: WAVEFORM_HEIGHT,
       url: objectUrl,
     });
+    waveSurfer.setVolume(isEditorMuted ? 0 : editorVolume);
 
     const waveRegions = waveSurfer.registerPlugin(RegionsPlugin.create());
 
@@ -508,23 +706,31 @@ export default function EditorPage() {
 
     waveSurfer.on("audioprocess", (time) => {
       setCurrentTime(time);
+      syncActiveSegmentForTime(time);
 
-      const currentActiveSegment =
-        segmentsRef.current.find((segment) => segment.id === activeSegmentIdRef.current) ?? segmentsRef.current[0] ?? null;
-
-      if (currentActiveSegment && time >= currentActiveSegment.end) {
+      const previewSegmentEnd = previewSegmentEndRef.current;
+      if (previewSegmentEnd !== null && time >= previewSegmentEnd) {
+        clearSegmentPreview();
         waveSurfer.pause();
-        waveSurfer.setTime(currentActiveSegment.start);
-        setCurrentTime(currentActiveSegment.start);
+        waveSurfer.setTime(previewSegmentEnd);
+        setCurrentTime(previewSegmentEnd);
       }
     });
 
     waveSurfer.on("interaction", () => {
-      setCurrentTime(waveSurfer.getCurrentTime());
+      const nextTime = waveSurfer.getCurrentTime();
+      resetFinalPreview();
+      clearSegmentPreview();
+      setCurrentTime(nextTime);
+      syncActiveSegmentForTime(nextTime);
     });
 
     waveSurfer.on("play", () => setIsPlaying(true));
     waveSurfer.on("pause", () => setIsPlaying(false));
+    waveSurfer.on("finish", () => {
+      clearSegmentPreview();
+      setIsPlaying(false);
+    });
 
     waveRegions.on("region-clicked", (region: any, event?: Event) => {
       event?.stopPropagation?.();
@@ -532,8 +738,11 @@ export default function EditorPage() {
       const trackId = selectedTrackIdRef.current;
       if (!trackId) return;
 
+      resetFinalPreview();
+      clearSegmentPreview();
       setTrackActiveSegment(trackId, region.id);
       activeSegmentIdRef.current = region.id;
+      applyRegionStyles(region.id);
       waveSurfer.setTime(region.start);
       setCurrentTime(region.start);
     });
@@ -572,10 +781,20 @@ export default function EditorPage() {
       regionMapRef.current.clear();
       wavesurferRef.current = null;
       regionsRef.current = null;
+      clearSegmentPreview();
       waveSurfer.destroy();
       URL.revokeObjectURL(objectUrl);
     };
-  }, [selectedTrack?.id]);
+  }, [resetFinalPreview, selectedTrack?.id]);
+
+  useEffect(() => {
+    wavesurferRef.current?.setVolume(isEditorMuted ? 0 : editorVolume);
+    const finalPreviewAudio = finalPreviewAudioRef.current;
+    if (!finalPreviewAudio) return;
+
+    finalPreviewAudio.volume = editorVolume;
+    finalPreviewAudio.muted = isEditorMuted;
+  }, [editorVolume, isEditorMuted]);
 
   const handleFadeInputChange =
     (segmentId: string, key: "fadeInInput" | "fadeOutInput") => (event: ChangeEvent<HTMLInputElement>) => {
@@ -604,19 +823,6 @@ export default function EditorPage() {
     }));
   };
 
-  const focusSegment = (segmentId: string) => {
-    const segment = segmentsRef.current.find((item) => item.id === segmentId);
-    if (!segment || !wavesurferRef.current) return;
-
-    const trackId = selectedTrack?.id;
-    if (!trackId) return;
-
-    setTrackActiveSegment(trackId, segmentId);
-    activeSegmentIdRef.current = segmentId;
-    wavesurferRef.current.setTime(segment.start);
-    setCurrentTime(segment.start);
-  };
-
   const previewSegment = (segmentId: string) => {
     const segment = segmentsRef.current.find((item) => item.id === segmentId);
     if (!segment || !wavesurferRef.current) return;
@@ -624,18 +830,275 @@ export default function EditorPage() {
     const trackId = selectedTrack?.id;
     if (!trackId) return;
 
+    resetFinalPreview();
     setTrackActiveSegment(trackId, segmentId);
     activeSegmentIdRef.current = segmentId;
+    applyRegionStyles(segmentId);
     wavesurferRef.current.pause();
     wavesurferRef.current.setTime(segment.start);
     setCurrentTime(segment.start);
-    wavesurferRef.current.play();
+    previewSegmentEndRef.current = segment.end;
+    void wavesurferRef.current.play();
   };
+
+  const seekTrack = (time: number) => {
+    const waveSurfer = wavesurferRef.current;
+    if (!waveSurfer || duration <= 0) return;
+
+    resetFinalPreview();
+    const nextTime = clamp(time, 0, duration);
+    clearSegmentPreview();
+    waveSurfer.setTime(nextTime);
+    setCurrentTime(nextTime);
+    syncActiveSegmentForTime(nextTime);
+  };
+
+  const skipTrackBy = (deltaSeconds: number) => {
+    seekTrack(currentTime + deltaSeconds);
+  };
+
+  const toggleTrackPlayback = () => {
+    const waveSurfer = wavesurferRef.current;
+    if (!waveSurfer || duration <= 0) return;
+
+    resetFinalPreview();
+    clearSegmentPreview();
+
+    if (isPlaying) {
+      waveSurfer.pause();
+      return;
+    }
+
+    void waveSurfer.play();
+  };
+
+  const jumpToSegment = (direction: -1 | 1) => {
+    if (!orderedSegments.length) return;
+
+    const currentSegmentIndex = orderedSegments.findIndex((segment) => segment.id === activeSegmentIdRef.current);
+    const fallbackIndex = orderedSegments.findIndex((segment) => currentTime < segment.end);
+    const seedIndex =
+      currentSegmentIndex >= 0 ? currentSegmentIndex : fallbackIndex >= 0 ? fallbackIndex : direction === 1 ? -1 : orderedSegments.length;
+    const nextIndex = clamp(seedIndex + direction, 0, orderedSegments.length - 1);
+    const nextSegment = orderedSegments[nextIndex];
+    const trackId = selectedTrack?.id;
+    if (!trackId || !wavesurferRef.current) return;
+
+    resetFinalPreview();
+    clearSegmentPreview();
+    setTrackActiveSegment(trackId, nextSegment.id);
+    activeSegmentIdRef.current = nextSegment.id;
+    applyRegionStyles(nextSegment.id);
+    wavesurferRef.current.setTime(nextSegment.start);
+    setCurrentTime(nextSegment.start);
+  };
+
+  const seekFinalPreview = (time: number) => {
+    const audio = finalPreviewAudioRef.current;
+    if (!audio || finalPreviewDuration <= 0) return;
+
+    const nextTime = clamp(time, 0, finalPreviewDuration);
+    audio.currentTime = nextTime;
+    setFinalPreviewCurrentTime(nextTime);
+  };
+
+  const skipFinalPreviewBy = (deltaSeconds: number) => {
+    seekFinalPreview(finalPreviewCurrentTime + deltaSeconds);
+  };
+
+  const jumpToFinalPreviewOverlay = (direction: -1 | 1) => {
+    if (!finalPreviewOverlays.length) return;
+
+    const currentOverlayIndex = finalPreviewOverlays.findIndex((overlay) => overlay.id === activeFinalPreviewOverlayId);
+    const fallbackIndex = finalPreviewOverlays.findIndex((overlay) => finalPreviewCurrentTime < overlay.end);
+    const seedIndex =
+      currentOverlayIndex >= 0
+        ? currentOverlayIndex
+        : fallbackIndex >= 0
+          ? fallbackIndex
+          : direction === 1
+            ? -1
+            : finalPreviewOverlays.length;
+    const nextIndex = clamp(seedIndex + direction, 0, finalPreviewOverlays.length - 1);
+    seekFinalPreview(finalPreviewOverlays[nextIndex].start);
+  };
+
+  const toggleFinalPreviewPlayback = async () => {
+    const audio = finalPreviewAudioRef.current;
+    if (!audio) return;
+
+    if (isFinalPreviewPlaying) {
+      audio.pause();
+      return;
+    }
+
+    try {
+      await audio.play();
+    } catch (error) {
+      console.error("Final preview playback failed", error);
+      setIsFinalPreviewPlaying(false);
+      setStatusMessage({ tone: "error", text: "Failed to play the final preview." });
+    }
+  };
+
+  const playFinalPreview = async () => {
+    if (!selectedTrack) return;
+
+    const trackSegments = [...orderedSegments].sort((left, right) => left.start - right.start);
+    if (!trackSegments.length) {
+      setStatusMessage({ tone: "info", text: "Add a segment before playing the final preview." });
+      return;
+    }
+
+    wavesurferRef.current?.pause();
+    clearSegmentPreview();
+    resetFinalPreview();
+    setIsFinalPreviewLoading(true);
+
+    try {
+      const audioBuffer = await decodeAudioFile(selectedTrack.file);
+      const processedSegments = trackSegments.map((segment) =>
+        buildProcessedSegmentData({
+          segmentId: segment.id,
+          audioBuffer,
+          start: segment.start,
+          end: segment.end,
+          fadeInSeconds: parseFadeSeconds(segment.fadeInInput),
+          fadeOutSeconds: parseFadeSeconds(segment.fadeOutInput),
+        }),
+      );
+      const mergedPreview = mergeProcessedSegments(processedSegments);
+      const previewUrl = URL.createObjectURL(encodeWavPreview(mergedPreview));
+      const previewAudio = new Audio(previewUrl);
+      const previewDuration = mergedPreview.sampleCount / mergedPreview.sampleRate;
+
+      finalPreviewUrlRef.current = previewUrl;
+      finalPreviewAudioRef.current = previewAudio;
+      previewAudio.preload = "metadata";
+      previewAudio.volume = editorVolume;
+      previewAudio.muted = isEditorMuted;
+      previewAudio.ontimeupdate = () => {
+        setFinalPreviewCurrentTime(previewAudio.currentTime);
+      };
+      previewAudio.onloadedmetadata = () => {
+        setFinalPreviewDuration(Number.isFinite(previewAudio.duration) ? previewAudio.duration : previewDuration);
+      };
+      previewAudio.onplay = () => {
+        setPlaybackMode("final-preview");
+        setIsFinalPreviewPlaying(true);
+        setIsFinalPreviewLoading(false);
+      };
+      previewAudio.onpause = () => {
+        if (!previewAudio.ended) {
+          setIsFinalPreviewPlaying(false);
+        }
+      };
+      previewAudio.onended = () => {
+        setIsFinalPreviewPlaying(false);
+        setFinalPreviewCurrentTime(Number.isFinite(previewAudio.duration) ? previewAudio.duration : previewDuration);
+      };
+
+      setPlaybackMode("final-preview");
+      setFinalPreviewOverlays(mergedPreview.overlays);
+      setFinalPreviewCurrentTime(0);
+      setFinalPreviewDuration(previewDuration);
+
+      await previewAudio.play();
+    } catch (error) {
+      resetFinalPreview();
+      setStatusMessage({
+        tone: "error",
+        text: error instanceof Error ? error.message : "Failed to build the final preview.",
+      });
+    } finally {
+      setIsFinalPreviewLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      const audio = finalPreviewAudioRef.current;
+      if (audio) {
+        audio.pause();
+        audio.ontimeupdate = null;
+        audio.onloadedmetadata = null;
+        audio.onplay = null;
+        audio.onpause = null;
+        audio.onended = null;
+        audio.removeAttribute("src");
+        finalPreviewAudioRef.current = null;
+      }
+
+      if (finalPreviewUrlRef.current) {
+        URL.revokeObjectURL(finalPreviewUrlRef.current);
+        finalPreviewUrlRef.current = null;
+      }
+
+      setDockState(null);
+    };
+  }, [setDockState]);
+
+  useEffect(() => {
+    setDockState({
+      playbackMode,
+      title: selectedTrack?.displayName ?? "Nothing selected",
+      subtitle: playbackMode === "final-preview" ? "Final preview" : undefined,
+      modeLabel: playbackMode === "final-preview" ? "Final" : `${orderedSegments.length} seg`,
+      isPlaying: displayIsPlaying,
+      currentTime: displayCurrentTime,
+      duration: displayDuration,
+      volume: editorVolume,
+      isMuted: isEditorMuted,
+      overlays:
+        playbackMode === "final-preview"
+          ? finalPreviewOverlays.map((overlay) => ({
+              ...overlay,
+              isActive: overlay.id === activeFinalPreviewOverlayId,
+            }))
+          : orderedSegments.map((segment) => ({
+              id: segment.id,
+              start: segment.start,
+              end: segment.end,
+              isActive: segment.id === activeSegment?.id,
+            })),
+      activeOverlayId: playbackMode === "final-preview" ? activeFinalPreviewOverlayId : activeSegment?.id ?? null,
+      onToggle: playbackMode === "final-preview" ? toggleFinalPreviewPlayback : toggleTrackPlayback,
+      onSeek: playbackMode === "final-preview" ? seekFinalPreview : seekTrack,
+      onSkipBack: playbackMode === "final-preview" ? () => skipFinalPreviewBy(-5) : () => skipTrackBy(-5),
+      onSkipForward: playbackMode === "final-preview" ? () => skipFinalPreviewBy(5) : () => skipTrackBy(5),
+      onJumpToPreviousOverlay: playbackMode === "final-preview" ? () => jumpToFinalPreviewOverlay(-1) : () => jumpToSegment(-1),
+      onJumpToNextOverlay: playbackMode === "final-preview" ? () => jumpToFinalPreviewOverlay(1) : () => jumpToSegment(1),
+      onSetVolume: (nextVolume) => {
+        const safeVolume = clamp(nextVolume, 0, 1);
+        setEditorVolume(safeVolume);
+        if (safeVolume > 0 && isEditorMuted) {
+          setIsEditorMuted(false);
+        }
+      },
+      onToggleMute: () => setIsEditorMuted((current) => !current),
+    });
+  }, [
+    activeSegment?.id,
+    activeFinalPreviewOverlayId,
+    displayCurrentTime,
+    displayDuration,
+    displayIsPlaying,
+    finalPreviewOverlays,
+    currentTime,
+    duration,
+    editorVolume,
+    isEditorMuted,
+    orderedSegments,
+    selectedTrack?.displayName,
+    playbackMode,
+    setDockState,
+  ]);
 
   const addSegment = () => {
     const trackId = selectedTrack?.id;
     if (!trackId || !regionsRef.current || duration <= 0) return;
 
+    clearSegmentPreview();
     const seedTime = activeSegment ? activeSegment.end : currentTime;
     const window = getSuggestedSegmentWindow(duration, seedTime);
     const nextSegment = createSegment(window.start, window.end);
@@ -659,6 +1122,7 @@ export default function EditorPage() {
     const trackId = selectedTrack?.id;
     if (!trackId) return;
 
+    clearSegmentPreview();
     const nextSegments = segmentsRef.current.filter((segment) => segment.id !== segmentId);
     const nextActiveSegmentId =
       segmentId === activeSegmentIdRef.current ? nextSegments[0]?.id ?? null : activeSegmentIdRef.current;
@@ -707,10 +1171,10 @@ export default function EditorPage() {
     const track = queuedTracks.find((item) => item.id === trackId);
     if (!track) return;
 
-    const trackSegments = [...track.segments].sort((left, right) => left.start - right.start);
+      const trackSegments = [...track.segments].sort((left, right) => left.start - right.start);
     if (!trackSegments.length) {
       setSelectedQueuedId(trackId);
-      setStatusMessage({ tone: "error", text: "Open the track, place a segment, then approve it." });
+      setStatusMessage({ tone: "error", text: "Add a segment before approving." });
       return;
     }
 
@@ -718,9 +1182,12 @@ export default function EditorPage() {
     setStatusMessage(null);
 
     try {
+      const audioBuffer = await decodeAudioFile(track.file);
+
       for (const [index, segment] of trackSegments.entries()) {
-        const blob = await createProcessedSegment({
-          file: track.file,
+        const blob = createProcessedSegment({
+          audioBuffer,
+          segmentId: segment.id,
           start: segment.start,
           end: segment.end,
           fadeInSeconds: parseFadeSeconds(segment.fadeInInput),
@@ -759,7 +1226,7 @@ export default function EditorPage() {
 
       setStatusMessage({
         tone: "success",
-        text: `${track.displayName} approved with ${trackSegments.length} segment${trackSegments.length === 1 ? "" : "s"}.`,
+        text: `${track.displayName} approved.`,
       });
     } catch (error) {
       setStatusMessage({
@@ -865,9 +1332,9 @@ export default function EditorPage() {
       });
 
       setDraftSavedAt(savedAt);
-      setStatusMessage({ tone: "success", text: "Draft saved." });
+      setStatusMessage({ tone: "success", text: "Saved locally." });
     } catch {
-      setStatusMessage({ tone: "error", text: "Failed to save the current draft." });
+      setStatusMessage({ tone: "error", text: "Failed to save locally." });
     } finally {
       setIsSavingDraft(false);
     }
@@ -884,9 +1351,9 @@ export default function EditorPage() {
       setDuplicateLibraryHashes([]);
       setRecentQueuedIds([]);
       setDraftSavedAt(null);
-      setStatusMessage({ tone: "info", text: "Draft cleared." });
+      setStatusMessage({ tone: "info", text: "Local draft cleared." });
     } catch {
-      setStatusMessage({ tone: "error", text: "Failed to clear the saved draft." });
+      setStatusMessage({ tone: "error", text: "Failed to clear the local draft." });
     } finally {
       setIsClearingDraft(false);
     }
@@ -897,6 +1364,22 @@ export default function EditorPage() {
     setQueuedTracks(remainingQueuedTracks);
     setSelectedQueuedId((current) => (current === trackId ? remainingQueuedTracks[0]?.id ?? null : current));
     setRecentQueuedIds((current) => current.filter((id) => id !== trackId));
+  };
+
+  const requeueApprovedTrack = (trackId: string) => {
+    const track = approvedTracks.find((item) => item.id === trackId);
+    if (!track) return;
+
+    const nextQueuedTrack: PersistedEditorTrack = {
+      ...track,
+      approvedAt: null,
+      segmentCount: null,
+    };
+
+    setApprovedTracks((current) => current.filter((item) => item.id !== trackId));
+    setQueuedTracks((current) => [nextQueuedTrack, ...current.filter((item) => item.id !== trackId)]);
+    setSelectedQueuedId(trackId);
+    setStatusMessage({ tone: "info", text: `${track.displayName} moved back to queue.` });
   };
 
   const dismissApprovedTrack = (trackId: string) => {
@@ -938,7 +1421,7 @@ export default function EditorPage() {
 
     if (!track.segments.length) {
       setSelectedQueuedId(track.id);
-      setStatusMessage({ tone: "info", text: "Track loaded. Review the segment, then approve it." });
+      setStatusMessage({ tone: "info", text: "Track loaded." });
       return;
     }
 
@@ -951,26 +1434,21 @@ export default function EditorPage() {
     clearDragState();
   };
 
-  const inventoryCountLabel = isInventorySyncing ? "Syncing library" : `${librarySources.length} in library`;
-
   return (
     <>
       <Script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js" strategy="lazyOnload" />
 
-      <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
-        <section className="editor-surface shrink-0 rounded-[30px] px-4 py-4 sm:px-5">
-          <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+      <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden">
+        <section className="editor-surface shrink-0 rounded-[28px] px-4 py-3 sm:px-5">
+          <div className="flex flex-col gap-3 xl:flex-row xl:items-start xl:justify-between">
             <div className="min-w-0">
               <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-accent-red">Editor</div>
               <div className="mt-1 flex flex-wrap items-center gap-2">
-                <h1 className="font-serif text-3xl text-text-main sm:text-4xl">Audio editor</h1>
+                <h1 className="font-serif text-2xl text-text-main sm:text-3xl">Audio editor</h1>
                 {usesRemoteUpload ? <Badge variant="green">Online</Badge> : <Badge variant="dim">Local mode</Badge>}
               </div>
-              <div className="mt-3 flex flex-wrap items-center gap-2">
-                <Badge variant="dim">{queuedTracks.length} queued</Badge>
-                <Badge variant="dim">{approvedTracks.length} approved</Badge>
-                <Badge variant="dim">{inventoryCountLabel}</Badge>
-                {draftSavedAt ? <Badge variant="blue">Saved {formatDateLabel(draftSavedAt)}</Badge> : null}
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                {draftSavedAt ? <Badge variant="blue">Local {formatDateLabel(draftSavedAt)}</Badge> : null}
               </div>
             </div>
 
@@ -996,7 +1474,7 @@ export default function EditorPage() {
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
                 disabled={isQueueing || isInventorySyncing || isDraftHydrating}
-                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-4 py-2.5 text-sm text-text-main transition-colors hover:bg-white/[0.09] disabled:cursor-not-allowed disabled:text-text-dim"
+                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-3.5 py-2 text-sm text-text-main transition-colors hover:bg-white/[0.09] disabled:cursor-not-allowed disabled:text-text-dim"
               >
                 {isQueueing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
                 Add files
@@ -1005,7 +1483,7 @@ export default function EditorPage() {
                 type="button"
                 onClick={() => folderInputRef.current?.click()}
                 disabled={isQueueing || isInventorySyncing || isDraftHydrating}
-                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-4 py-2.5 text-sm text-text-main transition-colors hover:bg-white/[0.09] disabled:cursor-not-allowed disabled:text-text-dim"
+                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-3.5 py-2 text-sm text-text-main transition-colors hover:bg-white/[0.09] disabled:cursor-not-allowed disabled:text-text-dim"
               >
                 <FolderOpen className="h-4 w-4" />
                 Add folder
@@ -1014,19 +1492,19 @@ export default function EditorPage() {
                 type="button"
                 onClick={() => void handleSaveDraft()}
                 disabled={isSavingDraft || isDraftHydrating}
-                className="inline-flex items-center gap-2 rounded-full border border-accent-blue/20 bg-accent-blue/10 px-4 py-2.5 text-sm text-accent-blue transition-colors hover:bg-accent-blue/16 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-text-dim"
+                className="inline-flex items-center gap-2 rounded-full border border-accent-blue/20 bg-accent-blue/10 px-3.5 py-2 text-sm text-accent-blue transition-colors hover:bg-accent-blue/16 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-text-dim"
               >
                 {isSavingDraft ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                Save draft
+                Save locally
               </button>
               <button
                 type="button"
                 onClick={() => void handleClearDraft()}
                 disabled={isClearingDraft}
-                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-4 py-2.5 text-sm text-text-dim transition-colors hover:bg-white/[0.06] hover:text-text-main disabled:cursor-not-allowed"
+                className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3.5 py-2 text-sm text-text-dim transition-colors hover:bg-white/[0.06] hover:text-text-main disabled:cursor-not-allowed"
               >
                 {isClearingDraft ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
-                Clear draft
+                Clear local
               </button>
             </div>
           </div>
@@ -1034,7 +1512,7 @@ export default function EditorPage() {
           {statusMessage ? (
             <div
               className={cn(
-                "mt-4 rounded-[22px] border px-4 py-3 font-sans text-sm",
+                "mt-3 rounded-[20px] border px-3.5 py-2 font-sans text-xs",
                 statusMessage.tone === "error" && "border-accent-red/25 bg-accent-red/12 text-accent-red",
                 statusMessage.tone === "success" && "border-accent-green/20 bg-accent-green/12 text-accent-green",
                 statusMessage.tone === "info" && "border-white/10 bg-white/[0.04] text-text-soft",
@@ -1045,41 +1523,33 @@ export default function EditorPage() {
           ) : null}
         </section>
 
-        <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(250px,1fr)_minmax(250px,1fr)]">
-          <div className="grid min-h-0 gap-4 xl:grid-rows-[minmax(240px,0.95fr)_minmax(0,1.05fr)]">
-            <section className="editor-surface flex min-h-0 flex-col rounded-[30px] p-4 sm:p-5">
-              <div className="flex items-start justify-between gap-4 border-b border-white/10 pb-4">
+        <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[minmax(0,1.95fr)_minmax(220px,0.72fr)_minmax(220px,0.72fr)]">
+          <div className="grid min-h-0 gap-3 xl:grid-rows-[minmax(360px,1.3fr)_minmax(230px,0.9fr)]">
+            <section className="editor-surface flex min-h-0 flex-col rounded-[28px] p-4 sm:p-5">
+              <div className="flex items-start justify-between gap-4 border-b border-white/10 pb-3">
                 <div className="min-w-0">
                   <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">Inspector</div>
                   {selectedTrack ? (
-                    <>
-                      <div className="mt-2 truncate font-serif text-2xl text-text-main">{selectedTrack.displayName}</div>
-                      <div className="mt-1 truncate font-sans text-sm text-text-dim">{selectedTrack.relativePath}</div>
-                    </>
+                    <div className="mt-2 truncate font-serif text-[1.7rem] text-text-main">{selectedTrack.displayName}</div>
                   ) : (
-                    <>
-                      <div className="mt-2 font-serif text-2xl text-text-main">No track selected</div>
-                      <div className="mt-1 font-sans text-sm text-text-dim">Add audio to start shaping segments.</div>
-                    </>
+                    <div className="mt-2 font-serif text-[1.7rem] text-text-main">Nothing selected</div>
                   )}
                 </div>
 
                 <div className="flex shrink-0 flex-wrap items-center gap-2">
+                  <Badge variant="dim">{selectedTrack ? `${orderedSegments.length} seg` : "Empty"}</Badge>
                   <Badge variant="dim">
-                    {selectedTrack ? `${orderedSegments.length} segment${orderedSegments.length === 1 ? "" : "s"}` : "Awaiting queue"}
-                  </Badge>
-                  <Badge variant="dim">
-                    {formatTime(currentTime)} / {formatTime(duration)}
+                    {formatTime(displayCurrentTime)} / {formatTime(displayDuration)}
                   </Badge>
                 </div>
               </div>
 
               {!selectedTrack ? (
                 <div className="flex min-h-0 flex-1 items-center justify-center rounded-[26px] border border-dashed border-white/10 bg-white/[0.03] px-6 py-8 text-center font-sans text-sm text-text-dim">
-                  {isInventorySyncing ? "Syncing approved library before queueing new files." : "No queued tracks yet."}
+                  {isInventorySyncing ? "Syncing…" : "Queue a track"}
                 </div>
               ) : (
-                <div className="mt-4 grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
+                <div className="mt-4 grid min-h-0 flex-1 gap-3 xl:grid-cols-[minmax(0,1.3fr)_minmax(250px,0.72fr)]">
                   <div className="min-h-0 rounded-[26px] border border-white/10 bg-black/18 p-3">
                     <div className="relative overflow-hidden rounded-[18px]" style={{ height: `${WAVEFORM_HEIGHT}px` }}>
                       <div ref={waveformRef} className="relative z-10 h-full w-full" />
@@ -1148,6 +1618,15 @@ export default function EditorPage() {
                       </button>
                       <button
                         type="button"
+                        onClick={() => void (playbackMode === "final-preview" && finalPreviewAudioRef.current ? toggleFinalPreviewPlayback() : playFinalPreview())}
+                        disabled={isFinalPreviewLoading || !orderedSegments.length}
+                        className="inline-flex items-center gap-2 rounded-full border border-accent-blue/20 bg-accent-blue/10 px-4 py-2 text-sm text-accent-blue transition-colors hover:bg-accent-blue/16 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-text-dim"
+                      >
+                        {isFinalPreviewLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                        {playbackMode === "final-preview" && displayIsPlaying ? "Pause final" : "Play final"}
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => void approveTrack(selectedTrack.id)}
                         disabled={approvingTrackId === selectedTrack.id || !orderedSegments.length}
                         className="inline-flex items-center gap-2 rounded-full border border-accent-gold/28 bg-accent-gold/12 px-4 py-2 text-sm text-accent-gold transition-colors hover:bg-accent-gold/18 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-text-dim"
@@ -1162,51 +1641,41 @@ export default function EditorPage() {
                     </div>
                   </div>
 
-                  <div className="min-h-0 rounded-[26px] border border-white/10 bg-white/[0.03] p-3">
+                  <div className="flex min-h-0 flex-col rounded-[26px] border border-white/10 bg-white/[0.03] p-3">
                     <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-3">
-                      <div>
-                        <div className="font-sans text-sm text-text-main">Segments</div>
-                        <div className="font-sans text-xs text-text-dim">{orderedSegments.length} ready on this track</div>
+                      <div className="font-sans text-sm text-text-main">Segments</div>
+                      <div className="flex items-center gap-2">
+                        <Badge variant="dim">{orderedSegments.length}</Badge>
+                        {displayIsPlaying ? <Badge variant="gold">{playbackMode === "final-preview" ? "Final" : "Playing"}</Badge> : null}
                       </div>
-                      {isPlaying ? <Badge variant="gold">Previewing</Badge> : null}
                     </div>
 
-                    <div className="mt-3 min-h-0 max-h-full space-y-3 overflow-y-auto pr-1">
+                    <div className="mt-3 min-h-0 flex-1 space-y-2.5 overflow-y-auto pr-1">
                       {orderedSegments.length === 0 ? (
-                        <div className="rounded-[22px] border border-dashed border-white/10 bg-white/[0.03] px-4 py-6 text-center font-sans text-sm text-text-dim">
-                          No segments yet.
+                        <div className="rounded-[18px] border border-dashed border-white/10 bg-white/[0.03] px-4 py-5 text-center font-sans text-sm text-text-dim">
+                          Empty
                         </div>
                       ) : (
                         orderedSegments.map((segment, index) => {
-                          const segmentDuration = getRegionDuration(segment.start, segment.end);
                           const isActive = segment.id === activeSegment?.id;
 
                           return (
                             <div
                               key={segment.id}
                               className={cn(
-                                "rounded-[22px] border px-3 py-3 transition-colors",
+                                "rounded-[18px] border px-3 py-2.5 transition-colors",
                                 isActive ? "border-accent-gold/30 bg-accent-gold/10" : "border-white/10 bg-white/[0.03]",
                               )}
                             >
                               <div className="flex items-center justify-between gap-3">
                                 <div>
-                                  <div className="font-sans text-sm text-text-main">Segment {String(index + 1).padStart(2, "0")}</div>
-                                  <div className="font-sans text-xs text-text-dim">
-                                    {formatTime(segment.start)} to {formatTime(segment.end)} · {formatTime(segmentDuration)}
-                                  </div>
+                                  <div className="font-sans text-sm text-text-main">S{String(index + 1).padStart(2, "0")}</div>
+                                  <div className="font-sans text-xs text-text-dim">{formatTime(segment.start)} - {formatTime(segment.end)}</div>
                                 </div>
                                 {isActive ? <Badge variant="gold">Active</Badge> : null}
                               </div>
 
-                              <div className="mt-3 flex flex-wrap gap-2">
-                                <button
-                                  type="button"
-                                  onClick={() => focusSegment(segment.id)}
-                                  className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-text-main transition-colors hover:bg-white/[0.08]"
-                                >
-                                  Focus
-                                </button>
+                              <div className="mt-2.5 flex flex-wrap gap-2">
                                 <button
                                   type="button"
                                   onClick={() => previewSegment(segment.id)}
@@ -1223,25 +1692,25 @@ export default function EditorPage() {
                                 </button>
                               </div>
 
-                              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                              <div className="mt-2.5 grid gap-2 sm:grid-cols-2">
                                 <label className="block">
-                                  <div className="mb-1 font-sans text-xs text-text-dim">Fade in</div>
+                                  <div className="mb-1 font-sans text-[11px] uppercase tracking-[0.14em] text-text-dim">In</div>
                                   <input
                                     inputMode="decimal"
                                     value={segment.fadeInInput}
                                     onChange={handleFadeInputChange(segment.id, "fadeInInput")}
                                     onBlur={() => handleFadeBlur(segment.id, "fadeInInput")}
-                                    className="w-full rounded-2xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-text-main outline-none transition-colors focus:border-accent-gold/35"
+                                    className="w-full rounded-xl border border-white/10 bg-black/20 px-2.5 py-1.5 text-sm text-text-main outline-none transition-colors focus:border-accent-gold/35"
                                   />
                                 </label>
                                 <label className="block">
-                                  <div className="mb-1 font-sans text-xs text-text-dim">Fade out</div>
+                                  <div className="mb-1 font-sans text-[11px] uppercase tracking-[0.14em] text-text-dim">Out</div>
                                   <input
                                     inputMode="decimal"
                                     value={segment.fadeOutInput}
                                     onChange={handleFadeInputChange(segment.id, "fadeOutInput")}
                                     onBlur={() => handleFadeBlur(segment.id, "fadeOutInput")}
-                                    className="w-full rounded-2xl border border-white/10 bg-black/20 px-3 py-2 text-sm text-text-main outline-none transition-colors focus:border-accent-gold/35"
+                                    className="w-full rounded-xl border border-white/10 bg-black/20 px-2.5 py-1.5 text-sm text-text-main outline-none transition-colors focus:border-accent-gold/35"
                                   />
                                 </label>
                               </div>
@@ -1255,22 +1724,22 @@ export default function EditorPage() {
               )}
             </section>
 
-            <section className="editor-surface flex min-h-0 flex-col rounded-[30px] p-4 sm:p-5">
-              <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-4">
+            <section className="editor-surface flex min-h-0 flex-col rounded-[28px] p-4">
+              <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-3">
                 <div>
                   <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">Queue</div>
-                  <div className="mt-2 font-sans text-lg text-text-main">{queuedTracks.length} waiting</div>
+                  <div className="mt-1.5 font-sans text-base text-text-main">{queuedTracks.length}</div>
                 </div>
                 {recentQueuedIds.length ? <Badge variant="blue">{recentQueuedIds.length} new</Badge> : null}
               </div>
 
-              <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
+              <div className="mt-3 min-h-0 flex-1 overflow-y-auto pr-1">
                 {queuedTracks.length === 0 ? (
                   <div className="flex h-full items-center justify-center rounded-[24px] border border-dashed border-white/10 bg-white/[0.03] px-4 py-6 text-center font-sans text-sm text-text-dim">
-                    No queued tracks.
+                    Empty
                   </div>
                 ) : (
-                  <div className="space-y-3">
+                  <div className="space-y-2">
                     {queuedTracks.map((track) => {
                       const isSelected = selectedTrack?.id === track.id;
 
@@ -1278,16 +1747,9 @@ export default function EditorPage() {
                         <EditorTrackCard
                           key={track.id}
                           title={track.displayName}
-                          subtitle={track.relativePath}
-                          meta={
-                            track.segments.length
-                              ? `${track.segments.length} segment${track.segments.length === 1 ? "" : "s"} ready`
-                              : "Open to place the first segment"
-                          }
-                          badgeLabel={
-                            isSelected ? "Editing" : recentQueuedIds.includes(track.id) ? "New" : track.segments.length ? "Ready" : "Queued"
-                          }
-                          badgeVariant={isSelected ? "gold" : recentQueuedIds.includes(track.id) ? "blue" : track.segments.length ? "green" : "dim"}
+                          density="compact"
+                          badgeLabel={isSelected ? "Editing" : recentQueuedIds.includes(track.id) ? "New" : undefined}
+                          badgeVariant={isSelected ? "gold" : "blue"}
                           isSelected={isSelected}
                           draggable
                           onClick={() => setSelectedQueuedId(track.id)}
@@ -1300,7 +1762,7 @@ export default function EditorPage() {
                                 event.stopPropagation();
                                 removeQueuedTrack(track.id);
                               }}
-                              className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-white/10 bg-white/[0.04] text-text-dim transition-colors hover:bg-accent-red/12 hover:text-accent-red"
+                              className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/[0.04] text-text-dim transition-colors hover:bg-accent-red/12 hover:text-accent-red"
                               aria-label={`Remove ${track.displayName}`}
                             >
                               <Trash2 className="h-4 w-4" />
@@ -1316,7 +1778,7 @@ export default function EditorPage() {
           </div>
 
           <section
-            className="editor-surface editor-drop-target flex min-h-0 flex-col rounded-[30px] p-4 sm:p-5"
+            className="editor-surface editor-drop-target flex min-h-0 flex-col rounded-[28px] p-3.5 sm:p-4"
             data-drop-active={activeDropLane === "approved" ? "true" : "false"}
             onDragOver={(event) => {
               event.preventDefault();
@@ -1329,18 +1791,18 @@ export default function EditorPage() {
               }
             }}
           >
-            <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-4">
+            <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-3">
               <div>
                 <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">Approved</div>
-                <div className="mt-2 font-sans text-lg text-text-main">{approvedTracks.length} this draft</div>
+                <div className="mt-1.5 font-sans text-base text-text-main">{approvedTracks.length}</div>
               </div>
               {approvingTrackId ? <Badge variant="gold">Approving</Badge> : null}
             </div>
 
-            <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
+            <div className="mt-3 min-h-0 flex-1 overflow-y-auto pr-1">
               {approvedTracks.length === 0 ? (
                 <div className="flex h-full items-center justify-center rounded-[24px] border border-dashed border-white/10 bg-white/[0.03] px-4 py-6 text-center font-sans text-sm text-text-dim">
-                  Drop a queued track here to approve it.
+                  Empty
                 </div>
               ) : (
                 <div className="space-y-3">
@@ -1349,21 +1811,32 @@ export default function EditorPage() {
                       key={track.id}
                       title={track.displayName}
                       subtitle={`${track.segmentCount ?? track.segments.length} segment${(track.segmentCount ?? track.segments.length) === 1 ? "" : "s"}`}
-                      meta={track.approvedAt ? `Approved ${formatDateLabel(track.approvedAt)}` : "Approved in this draft"}
                       badgeLabel="Approved"
                       badgeVariant="green"
                       actionNode={
-                        <button
-                          type="button"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            dismissApprovedTrack(track.id);
-                          }}
-                          className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-white/10 bg-white/[0.04] text-text-dim transition-colors hover:bg-white/[0.08] hover:text-text-main"
-                          aria-label={`Dismiss ${track.displayName}`}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
+                        <div className="flex flex-col gap-2">
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              requeueApprovedTrack(track.id);
+                            }}
+                            className="rounded-full border border-accent-blue/20 bg-accent-blue/10 px-3 py-1.5 text-xs text-accent-blue transition-colors hover:bg-accent-blue/16"
+                          >
+                            Re-edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              dismissApprovedTrack(track.id);
+                            }}
+                            className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-text-dim transition-colors hover:bg-accent-red/12 hover:text-accent-red"
+                            aria-label={`Delete ${track.displayName}`}
+                          >
+                            Delete
+                          </button>
+                        </div>
                       }
                     />
                   ))}
@@ -1373,7 +1846,7 @@ export default function EditorPage() {
           </section>
 
           <section
-            className="editor-surface editor-drop-target flex min-h-0 flex-col rounded-[30px] p-4 sm:p-5"
+            className="editor-surface editor-drop-target flex min-h-0 flex-col rounded-[28px] p-3.5 sm:p-4"
             data-drop-active={activeDropLane === "library" ? "true" : "false"}
             onDragOver={(event) => {
               event.preventDefault();
@@ -1386,10 +1859,10 @@ export default function EditorPage() {
               }
             }}
           >
-            <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-4">
+            <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-3">
               <div>
                 <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">Approved library</div>
-                <div className="mt-2 font-sans text-lg text-text-main">{librarySources.length} already approved</div>
+                <div className="mt-1.5 font-sans text-base text-text-main">{librarySources.length}</div>
               </div>
               <Link
                 href="/reel"
@@ -1402,7 +1875,7 @@ export default function EditorPage() {
 
             {duplicateLibraryHashes.length ? (
               <div className="mt-4 rounded-[22px] border border-accent-red/20 bg-accent-red/10 px-4 py-3 font-sans text-sm text-accent-red">
-                {duplicateLibraryHashes.length} reupload{duplicateLibraryHashes.length === 1 ? " was" : "s were"} already approved and skipped.
+                {duplicateLibraryHashes.length} skipped.
               </div>
             ) : null}
 
@@ -1412,15 +1885,15 @@ export default function EditorPage() {
               </div>
             ) : null}
 
-            <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
+            <div className="mt-3 min-h-0 flex-1 overflow-y-auto pr-1">
               {isInventoryLoading ? (
                 <div className="flex h-full items-center justify-center gap-3 rounded-[24px] border border-dashed border-white/10 bg-white/[0.03] px-4 py-6 text-center font-sans text-sm text-text-dim">
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  Loading approved library…
+                  Loading…
                 </div>
               ) : librarySources.length === 0 ? (
                 <div className="flex h-full items-center justify-center rounded-[24px] border border-dashed border-white/10 bg-white/[0.03] px-4 py-6 text-center font-sans text-sm text-text-dim">
-                  No approved sources yet.
+                  Empty
                 </div>
               ) : (
                 <div className="space-y-3">
@@ -1432,7 +1905,6 @@ export default function EditorPage() {
                         key={source.sourceHash}
                         title={source.sourceName}
                         subtitle={`${source.segmentCount} segment${source.segmentCount === 1 ? "" : "s"}`}
-                        meta={source.uploadedAt ? `Approved ${formatDateLabel(source.uploadedAt)}` : "Approved earlier"}
                         badgeLabel={isDuplicate ? "Duplicate" : "Library"}
                         badgeVariant={isDuplicate ? "red" : "dim"}
                         isDuplicate={isDuplicate}
