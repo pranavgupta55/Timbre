@@ -17,6 +17,7 @@ export type PersistedEditorTrack = {
   segments: PersistedTrackSegment[];
   approvedAt?: string | null;
   segmentCount?: number | null;
+  uploadState?: "pending" | "syncing" | "synced" | "error";
 };
 
 export type EditorDraftSnapshot = {

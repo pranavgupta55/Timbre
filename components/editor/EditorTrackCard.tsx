@@ -70,9 +70,9 @@ export function EditorTrackCard({
     >
       <div className={cn("flex items-start justify-between", density === "compact" ? "gap-3" : "gap-4")}>
         <div className="min-w-0 flex-1">
-          <div className={cn("flex items-center", density === "compact" ? "gap-2.5" : "gap-3")}>
+          <div className={cn("flex min-w-0 items-center", density === "compact" ? "gap-2.5" : "gap-3")}>
             {draggable ? <GripVertical className={cn("shrink-0 text-text-dim", density === "compact" ? "h-3.5 w-3.5" : "h-4 w-4")} /> : null}
-            <span className={cn("truncate font-sans text-text-main", density === "compact" ? "text-[13px]" : "text-sm")}>{title}</span>
+            <span className={cn("min-w-0 flex-1 truncate font-sans text-text-main", density === "compact" ? "text-[13px]" : "text-sm")}>{title}</span>
             {badgeLabel ? <Badge variant={badgeVariant}>{badgeLabel}</Badge> : null}
           </div>
           {subtitle ? <div className={cn("truncate font-sans text-xs text-text-dim", density === "compact" ? "mt-1.5" : "mt-2")}>{subtitle}</div> : null}

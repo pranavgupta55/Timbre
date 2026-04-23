@@ -79,6 +79,9 @@ type StorageListItem = {
   created_at?: string | null;
 };
 
+export const sortHighlightTracksBySegment = (tracks: HighlightTrack[]) =>
+  [...tracks].sort((left, right) => left.segmentIndex - right.segmentIndex);
+
 export async function fetchHighlightInventory(userId: string) {
   const { data, error } = await supabase.storage.from("highlights").list(userId, {
     limit: 1000,
@@ -143,4 +146,38 @@ export async function fetchHighlightInventory(userId: string) {
   });
 
   return { sources, tracks };
+}
+
+export async function downloadHighlightTrack(storagePath: string) {
+  const { data, error } = await supabase.storage.from("highlights").download(storagePath);
+
+  if (error || !data) {
+    throw error ?? new Error("Failed to download the saved highlight.");
+  }
+
+  return data;
+}
+
+export async function deleteHighlightSourceAssets(userId: string, sourceHash: string) {
+  const { data, error } = await supabase.storage.from("highlights").list(userId, {
+    limit: 1000,
+  });
+
+  if (error) {
+    throw error;
+  }
+
+  const pathsToRemove = ((data ?? []) as StorageListItem[])
+    .filter((item) => item.name.startsWith(`${sourceHash}__`))
+    .map((item) => `${userId}/${item.name}`);
+
+  if (!pathsToRemove.length) {
+    return;
+  }
+
+  const { error: removeError } = await supabase.storage.from("highlights").remove(pathsToRemove);
+
+  if (removeError) {
+    throw removeError;
+  }
 }

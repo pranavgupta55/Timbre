@@ -17,13 +17,23 @@ import {
   type PersistedEditorTrack,
   type PersistedTrackSegment,
 } from "@/lib/editor-draft-storage";
-import { buildSegmentStoragePath, fetchHighlightInventory, stripExtension, type ApprovedSource } from "@/lib/highlights";
+import {
+  buildSegmentStoragePath,
+  deleteHighlightSourceAssets,
+  downloadHighlightTrack,
+  fetchHighlightInventory,
+  sortHighlightTracksBySegment,
+  stripExtension,
+  type ApprovedSource,
+  type HighlightTrack,
+} from "@/lib/highlights";
 import { supabase } from "@/lib/supabase";
 import { cn } from "@/lib/utils";
 
 const WAVEFORM_HEIGHT = 176;
 const DEFAULT_SEGMENT_LENGTH = 15;
 const DEFAULT_FADE_SECONDS = "2.0";
+const LIBRARY_SEGMENT_FADE_SECONDS = "0.0";
 
 type StatusTone = "info" | "success" | "error";
 type StatusMessage = { tone: StatusTone; text: string } | null;
@@ -97,6 +107,14 @@ const createSegment = (start: number, end: number): PersistedTrackSegment => ({
   fadeOutInput: DEFAULT_FADE_SECONDS,
 });
 
+const createSavedSegment = (start: number, end: number): PersistedTrackSegment => ({
+  id: createSegmentId(),
+  start,
+  end,
+  fadeInInput: LIBRARY_SEGMENT_FADE_SECONDS,
+  fadeOutInput: LIBRARY_SEGMENT_FADE_SECONDS,
+});
+
 const getSuggestedSegmentWindow = (trackDuration: number, seedTime: number) => {
   if (trackDuration <= 0) {
     return { start: 0, end: 0 };
@@ -165,8 +183,7 @@ const createDraftTrack = (file: File, sourceHash: string): PersistedEditorTrack 
 const getAudioContextCtor = () =>
   window.AudioContext || (window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
 
-const decodeAudioFile = async (file: File) => {
-  const arrayBuffer = await file.arrayBuffer();
+const decodeAudioArrayBuffer = async (arrayBuffer: ArrayBuffer) => {
   const AudioContextCtor = getAudioContextCtor();
 
   if (!AudioContextCtor) {
@@ -181,6 +198,8 @@ const decodeAudioFile = async (file: File) => {
     await audioCtx.close();
   }
 };
+
+const decodeAudioFile = async (file: File) => decodeAudioArrayBuffer(await file.arrayBuffer());
 
 const buildProcessedSegmentData = ({
   segmentId,
@@ -385,6 +404,7 @@ export default function EditorPage() {
   const [queuedTracks, setQueuedTracks] = useState<PersistedEditorTrack[]>([]);
   const [approvedTracks, setApprovedTracks] = useState<PersistedEditorTrack[]>([]);
   const [approvedLibrary, setApprovedLibrary] = useState<ApprovedSource[]>([]);
+  const [approvedLibraryTracks, setApprovedLibraryTracks] = useState<HighlightTrack[]>([]);
   const [selectedQueuedId, setSelectedQueuedId] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<StatusMessage>(null);
   const [inventoryError, setInventoryError] = useState("");
@@ -405,11 +425,12 @@ export default function EditorPage() {
   const [finalPreviewCurrentTime, setFinalPreviewCurrentTime] = useState(0);
   const [finalPreviewDuration, setFinalPreviewDuration] = useState(0);
   const [finalPreviewOverlays, setFinalPreviewOverlays] = useState<EditorDockOverlay[]>([]);
-  const [approvingTrackId, setApprovingTrackId] = useState<string | null>(null);
   const [duplicateLibraryHashes, setDuplicateLibraryHashes] = useState<string[]>([]);
   const [recentQueuedIds, setRecentQueuedIds] = useState<string[]>([]);
   const [activeDropLane, setActiveDropLane] = useState<DropLane>(null);
   const [dragTrackId, setDragTrackId] = useState<string | null>(null);
+  const [loadingLibrarySourceHash, setLoadingLibrarySourceHash] = useState<string | null>(null);
+  const [isUploadingApproved, setIsUploadingApproved] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
@@ -457,6 +478,11 @@ export default function EditorPage() {
     return approvedLibrary.filter((source) => !approvedHashes.has(source.sourceHash) && !queuedHashes.has(source.sourceHash));
   }, [approvedLibrary, approvedTracks, queuedTracks]);
 
+  const pendingApprovedCount = useMemo(
+    () => approvedTracks.filter((track) => track.uploadState !== "synced").length,
+    [approvedTracks],
+  );
+
   useEffect(() => {
     if (selectedQueuedId && queuedTracks.some((track) => track.id === selectedQueuedId)) {
       return;
@@ -490,7 +516,12 @@ export default function EditorPage() {
         }
 
         setQueuedTracks(snapshot.queuedTracks ?? []);
-        setApprovedTracks(snapshot.approvedTracks ?? []);
+        setApprovedTracks(
+          (snapshot.approvedTracks ?? []).map((track) => ({
+            ...track,
+            uploadState: track.uploadState ?? (track.approvedAt ? "synced" : "pending"),
+          })),
+        );
         setSelectedQueuedId(snapshot.selectedQueuedId ?? snapshot.queuedTracks[0]?.id ?? null);
         setDraftSavedAt(snapshot.savedAt);
         setStatusMessage({ tone: "info", text: "Local draft restored." });
@@ -517,6 +548,7 @@ export default function EditorPage() {
 
     if (!usesRemoteUpload || !user?.id) {
       setApprovedLibrary([]);
+      setApprovedLibraryTracks([]);
       setInventoryError("");
       setIsInventoryLoading(false);
       return;
@@ -533,10 +565,12 @@ export default function EditorPage() {
 
         if (!isCancelled) {
           setApprovedLibrary(inventory.sources);
+          setApprovedLibraryTracks(inventory.tracks);
         }
       } catch (error) {
         if (!isCancelled) {
           setApprovedLibrary([]);
+          setApprovedLibraryTracks([]);
           setInventoryError(error instanceof Error ? error.message : "Failed to load the approved library.");
         }
       } finally {
@@ -563,6 +597,12 @@ export default function EditorPage() {
 
   const updateQueuedTrack = (trackId: string, updater: (track: PersistedEditorTrack) => PersistedEditorTrack) => {
     setQueuedTracks((currentTracks) =>
+      currentTracks.map((track) => (track.id === trackId ? updater(track) : track)),
+    );
+  };
+
+  const updateApprovedTrack = (trackId: string, updater: (track: PersistedEditorTrack) => PersistedEditorTrack) => {
+    setApprovedTracks((currentTracks) =>
       currentTracks.map((track) => (track.id === trackId ? updater(track) : track)),
     );
   };
@@ -1161,81 +1201,218 @@ export default function EditorPage() {
     try {
       const inventory = await fetchHighlightInventory(user.id);
       setApprovedLibrary(inventory.sources);
+      setApprovedLibraryTracks(inventory.tracks);
       setInventoryError("");
     } catch (error) {
       setInventoryError(error instanceof Error ? error.message : "Failed to refresh the approved library.");
     }
   };
 
-  const approveTrack = async (trackId: string) => {
+  const uploadApprovedTrack = async (track: PersistedEditorTrack) => {
+    if (!user?.id) {
+      throw new Error("Sign in to upload approved tracks.");
+    }
+
+    const trackSegments = [...track.segments].sort((left, right) => left.start - right.start);
+    if (!trackSegments.length) {
+      throw new Error(`Add a segment before uploading ${track.displayName}.`);
+    }
+
+    const audioBuffer = await decodeAudioFile(track.file);
+    await deleteHighlightSourceAssets(user.id, track.sourceHash);
+
+    for (const [index, segment] of trackSegments.entries()) {
+      const blob = createProcessedSegment({
+        audioBuffer,
+        segmentId: segment.id,
+        start: segment.start,
+        end: segment.end,
+        fadeInSeconds: parseFadeSeconds(segment.fadeInInput),
+        fadeOutSeconds: parseFadeSeconds(segment.fadeOutInput),
+      });
+
+      const storagePath = buildSegmentStoragePath(user.id, track.sourceHash, track.displayName, index);
+      const { error } = await supabase.storage.from("highlights").upload(storagePath, blob, {
+        contentType: "audio/mpeg",
+        upsert: true,
+      });
+
+      if (error) {
+        throw error;
+      }
+    }
+
+    return trackSegments.length;
+  };
+
+  const loadLibrarySourceToApproved = async (source: ApprovedSource) => {
+    if (!usesRemoteUpload || !user?.id) {
+      setStatusMessage({ tone: "info", text: "Library loading is only available online." });
+      return;
+    }
+
+    const sourceTracks = sortHighlightTracksBySegment(
+      approvedLibraryTracks.filter((track) => track.sourceHash === source.sourceHash),
+    );
+
+    if (!sourceTracks.length) {
+      setStatusMessage({ tone: "error", text: `No saved segments were found for ${source.sourceName}.` });
+      return;
+    }
+
+    setLoadingLibrarySourceHash(source.sourceHash);
+    setStatusMessage(null);
+
+    try {
+      const processedSegments: ProcessedSegmentData[] = [];
+
+      for (const sourceTrack of sourceTracks) {
+        const blob = await downloadHighlightTrack(sourceTrack.storage_path);
+        const audioBuffer = await decodeAudioArrayBuffer(await blob.arrayBuffer());
+
+        processedSegments.push(
+          buildProcessedSegmentData({
+            segmentId: createSegmentId(),
+            audioBuffer,
+            start: 0,
+            end: audioBuffer.duration,
+            fadeInSeconds: 0,
+            fadeOutSeconds: 0,
+          }),
+        );
+      }
+
+      const mergedPreview = mergeProcessedSegments(processedSegments);
+      const file = new File([encodeWavPreview(mergedPreview)], `${source.sourceName}.wav`, {
+        type: "audio/wav",
+        lastModified: Date.now(),
+      });
+
+      let offset = 0;
+      const reconstructedSegments = processedSegments.map((segment) => {
+        const segmentDuration = segment.sampleCount / segment.sampleRate;
+        const nextSegment = createSavedSegment(offset, offset + segmentDuration);
+        offset += segmentDuration;
+        return nextSegment;
+      });
+
+      const loadedTrack: PersistedEditorTrack = {
+        ...createDraftTrack(file, source.sourceHash),
+        displayName: source.sourceName,
+        relativePath: source.sampleStoragePath,
+        segments: reconstructedSegments,
+        activeSegmentId: reconstructedSegments[0]?.id ?? null,
+        approvedAt: source.uploadedAt,
+        segmentCount: reconstructedSegments.length,
+        uploadState: "synced",
+      };
+
+      setApprovedTracks((current) => [loadedTrack, ...current.filter((item) => item.sourceHash !== source.sourceHash)]);
+      setDuplicateLibraryHashes((current) => current.filter((hash) => hash !== source.sourceHash));
+      setStatusMessage({
+        tone: "success",
+        text: `${source.sourceName} moved into Approved. Use Re-edit to adjust it.`,
+      });
+    } catch (error) {
+      setStatusMessage({
+        tone: "error",
+        text: error instanceof Error ? error.message : `Failed to load ${source.sourceName} from the library.`,
+      });
+    } finally {
+      setLoadingLibrarySourceHash(null);
+    }
+  };
+
+  const handleUploadApprovedTracks = async () => {
+    if (!usesRemoteUpload || !user?.id) {
+      setStatusMessage({ tone: "info", text: "Uploads are only available while signed in." });
+      return;
+    }
+
+    const tracksToUpload = approvedTracks.filter((track) => track.uploadState !== "synced");
+    if (!tracksToUpload.length) {
+      setStatusMessage({ tone: "info", text: "All approved songs are already uploaded." });
+      return;
+    }
+
+    setIsUploadingApproved(true);
+    setStatusMessage(null);
+
+    let uploadedCount = 0;
+    const failedTracks: string[] = [];
+
+    for (const track of tracksToUpload) {
+      updateApprovedTrack(track.id, (current) => ({ ...current, uploadState: "syncing" }));
+
+      try {
+        const segmentCount = await uploadApprovedTrack(track);
+        const uploadedAt = new Date().toISOString();
+
+        updateApprovedTrack(track.id, (current) => ({
+          ...current,
+          approvedAt: uploadedAt,
+          segmentCount,
+          uploadState: "synced",
+        }));
+        uploadedCount += 1;
+      } catch (error) {
+        console.error("Approved upload failed", error);
+        updateApprovedTrack(track.id, (current) => ({ ...current, uploadState: "error" }));
+        failedTracks.push(track.displayName);
+      }
+    }
+
+    if (uploadedCount > 0) {
+      await refreshInventory();
+    }
+
+    if (failedTracks.length > 0) {
+      const summary =
+        uploadedCount > 0
+          ? `Uploaded ${uploadedCount} approved track${uploadedCount === 1 ? "" : "s"}. ${failedTracks.length} still need${failedTracks.length === 1 ? "s" : ""} attention.`
+          : `Upload failed for ${failedTracks.join(", ")}.`;
+
+      setStatusMessage({ tone: "error", text: summary });
+    } else {
+      setStatusMessage({
+        tone: "success",
+        text: `Uploaded ${uploadedCount} approved track${uploadedCount === 1 ? "" : "s"}.`,
+      });
+    }
+
+    setIsUploadingApproved(false);
+  };
+
+  const approveTrack = (trackId: string) => {
     const track = queuedTracks.find((item) => item.id === trackId);
     if (!track) return;
 
-      const trackSegments = [...track.segments].sort((left, right) => left.start - right.start);
+    const trackSegments = [...track.segments].sort((left, right) => left.start - right.start);
     if (!trackSegments.length) {
       setSelectedQueuedId(trackId);
       setStatusMessage({ tone: "error", text: "Add a segment before approving." });
       return;
     }
 
-    setApprovingTrackId(trackId);
-    setStatusMessage(null);
+    const approvedAt = new Date().toISOString();
+    const nextApprovedTrack: PersistedEditorTrack = {
+      ...track,
+      segments: trackSegments,
+      activeSegmentId: track.activeSegmentId ?? trackSegments[0]?.id ?? null,
+      approvedAt,
+      segmentCount: trackSegments.length,
+      uploadState: usesRemoteUpload ? "pending" : "synced",
+    };
 
-    try {
-      const audioBuffer = await decodeAudioFile(track.file);
-
-      for (const [index, segment] of trackSegments.entries()) {
-        const blob = createProcessedSegment({
-          audioBuffer,
-          segmentId: segment.id,
-          start: segment.start,
-          end: segment.end,
-          fadeInSeconds: parseFadeSeconds(segment.fadeInInput),
-          fadeOutSeconds: parseFadeSeconds(segment.fadeOutInput),
-        });
-
-        if (usesRemoteUpload && user?.id) {
-          const storagePath = buildSegmentStoragePath(user.id, track.sourceHash, track.displayName, index);
-          const { error } = await supabase.storage.from("highlights").upload(storagePath, blob, {
-            contentType: "audio/mpeg",
-            upsert: true,
-          });
-
-          if (error) {
-            throw error;
-          }
-        }
-      }
-
-      const approvedAt = new Date().toISOString();
-      const nextApprovedTrack: PersistedEditorTrack = {
-        ...track,
-        approvedAt,
-        segmentCount: trackSegments.length,
-      };
-
-      const remainingQueuedTracks = queuedTracks.filter((item) => item.id !== trackId);
-      setQueuedTracks(remainingQueuedTracks);
-      setSelectedQueuedId((current) => (current === trackId ? remainingQueuedTracks[0]?.id ?? null : current));
-      setApprovedTracks((current) => [nextApprovedTrack, ...current.filter((item) => item.id !== trackId)]);
-      setRecentQueuedIds((current) => current.filter((id) => id !== trackId));
-
-      if (usesRemoteUpload && user?.id) {
-        await refreshInventory();
-      }
-
-      setStatusMessage({
-        tone: "success",
-        text: `${track.displayName} approved.`,
-      });
-    } catch (error) {
-      setStatusMessage({
-        tone: "error",
-        text: error instanceof Error ? error.message : "Failed to process and upload the selected track.",
-      });
-    } finally {
-      setApprovingTrackId(null);
-    }
+    const remainingQueuedTracks = queuedTracks.filter((item) => item.id !== trackId);
+    setQueuedTracks(remainingQueuedTracks);
+    setSelectedQueuedId((current) => (current === trackId ? remainingQueuedTracks[0]?.id ?? null : current));
+    setApprovedTracks((current) => [nextApprovedTrack, ...current.filter((item) => item.id !== trackId)]);
+    setRecentQueuedIds((current) => current.filter((id) => id !== trackId));
+    setStatusMessage({
+      tone: "success",
+      text: usesRemoteUpload ? `${track.displayName} approved locally. Upload when ready.` : `${track.displayName} approved.`,
+    });
   };
 
   const handleQueueSelection = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -1434,6 +1611,19 @@ export default function EditorPage() {
     clearDragState();
   };
 
+  const getApprovedTrackBadge = (track: PersistedEditorTrack) => {
+    switch (track.uploadState) {
+      case "pending":
+        return { label: "Pending upload", variant: "gold" as const };
+      case "syncing":
+        return { label: "Uploading", variant: "blue" as const };
+      case "error":
+        return { label: "Upload error", variant: "red" as const };
+      default:
+        return { label: "Approved", variant: "green" as const };
+    }
+  };
+
   return (
     <>
       <Script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js" strategy="lazyOnload" />
@@ -1449,6 +1639,7 @@ export default function EditorPage() {
               </div>
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 {draftSavedAt ? <Badge variant="blue">Local {formatDateLabel(draftSavedAt)}</Badge> : null}
+                {usesRemoteUpload && pendingApprovedCount > 0 ? <Badge variant="gold">{pendingApprovedCount} pending upload</Badge> : null}
               </div>
             </div>
 
@@ -1490,6 +1681,15 @@ export default function EditorPage() {
               </button>
               <button
                 type="button"
+                onClick={() => void handleUploadApprovedTracks()}
+                disabled={!usesRemoteUpload || isUploadingApproved || pendingApprovedCount === 0 || isDraftHydrating}
+                className="inline-flex items-center gap-2 rounded-full border border-accent-gold/28 bg-accent-gold/12 px-3.5 py-2 text-sm text-accent-gold transition-colors hover:bg-accent-gold/18 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-text-dim"
+              >
+                {isUploadingApproved ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                {isUploadingApproved ? "Uploading…" : pendingApprovedCount > 0 ? `Upload approved (${pendingApprovedCount})` : "Upload approved"}
+              </button>
+              <button
+                type="button"
                 onClick={() => void handleSaveDraft()}
                 disabled={isSavingDraft || isDraftHydrating}
                 className="inline-flex items-center gap-2 rounded-full border border-accent-blue/20 bg-accent-blue/10 px-3.5 py-2 text-sm text-accent-blue transition-colors hover:bg-accent-blue/16 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-text-dim"
@@ -1523,7 +1723,7 @@ export default function EditorPage() {
           ) : null}
         </section>
 
-        <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[minmax(0,1.95fr)_minmax(220px,0.72fr)_minmax(220px,0.72fr)]">
+        <div className="grid min-h-0 flex-1 gap-3 xl:grid-cols-[minmax(0,1.85fr)_minmax(280px,0.9fr)_minmax(320px,1fr)]">
           <div className="grid min-h-0 gap-3 xl:grid-rows-[minmax(360px,1.3fr)_minmax(230px,0.9fr)]">
             <section className="editor-surface flex min-h-0 flex-col rounded-[28px] p-4 sm:p-5">
               <div className="flex items-start justify-between gap-4 border-b border-white/10 pb-3">
@@ -1628,14 +1828,10 @@ export default function EditorPage() {
                       <button
                         type="button"
                         onClick={() => void approveTrack(selectedTrack.id)}
-                        disabled={approvingTrackId === selectedTrack.id || !orderedSegments.length}
+                        disabled={!orderedSegments.length}
                         className="inline-flex items-center gap-2 rounded-full border border-accent-gold/28 bg-accent-gold/12 px-4 py-2 text-sm text-accent-gold transition-colors hover:bg-accent-gold/18 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-text-dim"
                       >
-                        {approvingTrackId === selectedTrack.id ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <Check className="h-4 w-4" />
-                        )}
+                        <Check className="h-4 w-4" />
                         Approve selected
                       </button>
                     </div>
@@ -1796,7 +1992,7 @@ export default function EditorPage() {
                 <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">Approved</div>
                 <div className="mt-1.5 font-sans text-base text-text-main">{approvedTracks.length}</div>
               </div>
-              {approvingTrackId ? <Badge variant="gold">Approving</Badge> : null}
+              {pendingApprovedCount > 0 ? <Badge variant="gold">{pendingApprovedCount} pending</Badge> : null}
             </div>
 
             <div className="mt-3 min-h-0 flex-1 overflow-y-auto pr-1">
@@ -1806,40 +2002,44 @@ export default function EditorPage() {
                 </div>
               ) : (
                 <div className="space-y-3">
-                  {approvedTracks.map((track) => (
-                    <EditorTrackCard
-                      key={track.id}
-                      title={track.displayName}
-                      subtitle={`${track.segmentCount ?? track.segments.length} segment${(track.segmentCount ?? track.segments.length) === 1 ? "" : "s"}`}
-                      badgeLabel="Approved"
-                      badgeVariant="green"
-                      actionNode={
-                        <div className="flex flex-col gap-2">
-                          <button
-                            type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              requeueApprovedTrack(track.id);
-                            }}
-                            className="rounded-full border border-accent-blue/20 bg-accent-blue/10 px-3 py-1.5 text-xs text-accent-blue transition-colors hover:bg-accent-blue/16"
-                          >
-                            Re-edit
-                          </button>
-                          <button
-                            type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              dismissApprovedTrack(track.id);
-                            }}
-                            className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-text-dim transition-colors hover:bg-accent-red/12 hover:text-accent-red"
-                            aria-label={`Delete ${track.displayName}`}
-                          >
-                            Delete
-                          </button>
-                        </div>
-                      }
-                    />
-                  ))}
+                  {approvedTracks.map((track) => {
+                    const badge = getApprovedTrackBadge(track);
+
+                    return (
+                      <EditorTrackCard
+                        key={track.id}
+                        title={track.displayName}
+                        subtitle={`${track.segmentCount ?? track.segments.length} segment${(track.segmentCount ?? track.segments.length) === 1 ? "" : "s"}`}
+                        badgeLabel={badge.label}
+                        badgeVariant={badge.variant}
+                        actionNode={
+                          <div className="flex flex-col gap-2">
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                requeueApprovedTrack(track.id);
+                              }}
+                              className="rounded-full border border-accent-blue/20 bg-accent-blue/10 px-3 py-1.5 text-xs text-accent-blue transition-colors hover:bg-accent-blue/16"
+                            >
+                              Re-edit
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                dismissApprovedTrack(track.id);
+                              }}
+                              className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-text-dim transition-colors hover:bg-accent-red/12 hover:text-accent-red"
+                              aria-label={`Delete ${track.displayName}`}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        }
+                      />
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -1899,6 +2099,7 @@ export default function EditorPage() {
                 <div className="space-y-3">
                   {librarySources.map((source) => {
                     const isDuplicate = duplicateLibraryHashes.includes(source.sourceHash);
+                    const isLoading = loadingLibrarySourceHash === source.sourceHash;
 
                     return (
                       <EditorTrackCard
@@ -1908,6 +2109,19 @@ export default function EditorPage() {
                         badgeLabel={isDuplicate ? "Duplicate" : "Library"}
                         badgeVariant={isDuplicate ? "red" : "dim"}
                         isDuplicate={isDuplicate}
+                        actionNode={
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void loadLibrarySourceToApproved(source);
+                            }}
+                            disabled={isLoading}
+                            className="rounded-full border border-accent-blue/20 bg-accent-blue/10 px-3 py-1.5 text-xs text-accent-blue transition-colors hover:bg-accent-blue/16 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-text-dim"
+                          >
+                            {isLoading ? "Loading…" : "Move to approved"}
+                          </button>
+                        }
                       />
                     );
                   })}
