@@ -1537,10 +1537,7 @@ export default function EditorPage() {
   };
 
   const removeQueuedTrack = (trackId: string) => {
-    const remainingQueuedTracks = queuedTracks.filter((track) => track.id !== trackId);
-    setQueuedTracks(remainingQueuedTracks);
-    setSelectedQueuedId((current) => (current === trackId ? remainingQueuedTracks[0]?.id ?? null : current));
-    setRecentQueuedIds((current) => current.filter((id) => id !== trackId));
+    void deleteTrack(trackId, "queued");
   };
 
   const requeueApprovedTrack = (trackId: string) => {
@@ -1559,8 +1556,40 @@ export default function EditorPage() {
     setStatusMessage({ tone: "info", text: `${track.displayName} moved back to queue.` });
   };
 
+  const deleteTrack = async (trackId: string, lane: "queued" | "approved") => {
+    const track = (lane === "queued" ? queuedTracks : approvedTracks).find((item) => item.id === trackId);
+    if (!track) return;
+
+    const isRemoteTrack = usesRemoteUpload && Boolean(user?.id) && approvedLibrary.some((source) => source.sourceHash === track.sourceHash);
+
+    try {
+      if (isRemoteTrack && user?.id) {
+        await deleteHighlightSourceAssets(user.id, track.sourceHash);
+        await refreshInventory();
+      }
+
+      if (lane === "queued") {
+        const remainingQueuedTracks = queuedTracks.filter((item) => item.id !== trackId);
+        setQueuedTracks(remainingQueuedTracks);
+        setSelectedQueuedId((current) => (current === trackId ? remainingQueuedTracks[0]?.id ?? null : current));
+        setRecentQueuedIds((current) => current.filter((id) => id !== trackId));
+      } else {
+        setApprovedTracks((current) => current.filter((item) => item.id !== trackId));
+      }
+
+      if (isRemoteTrack) {
+        setStatusMessage({ tone: "success", text: `${track.displayName} deleted from the approved library.` });
+      }
+    } catch (error) {
+      setStatusMessage({
+        tone: "error",
+        text: error instanceof Error ? error.message : `Failed to delete ${track.displayName}.`,
+      });
+    }
+  };
+
   const dismissApprovedTrack = (trackId: string) => {
-    setApprovedTracks((current) => current.filter((track) => track.id !== trackId));
+    void deleteTrack(trackId, "approved");
   };
 
   const beginTrackDrag = (trackId: string, lane: DragLane) => (event: DragEvent<HTMLDivElement>) => {
