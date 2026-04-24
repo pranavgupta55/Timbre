@@ -1,21 +1,21 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react";
 import Script from "next/script";
-import WaveSurfer from "wavesurfer.js";
-import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
 import { Check, FolderOpen, Library, Loader2, Play, Save, Trash2, Upload, Waves } from "lucide-react";
 import { EditorTrackCard } from "@/components/editor/EditorTrackCard";
+import { useEditorPlaybackController } from "@/components/editor/useEditorPlaybackController";
 import { Badge } from "@/components/ui/TacticalUI";
 import { useAuth } from "@/context/AuthContext";
-import { useEditorAudioDock, type EditorDockOverlay } from "@/context/EditorAudioDockContext";
+import { useSetEditorAudioDock, type EditorDockOverlay } from "@/context/EditorAudioDockContext";
 import {
   clearEditorDraftSnapshot,
   loadEditorDraftSnapshot,
   saveEditorDraftSnapshot,
   type PersistedEditorTrack,
   type PersistedTrackSegment,
+  type TrackUploadMode,
 } from "@/lib/editor-draft-storage";
 import {
   buildSegmentStoragePath,
@@ -34,12 +34,13 @@ const WAVEFORM_HEIGHT = 176;
 const DEFAULT_SEGMENT_LENGTH = 15;
 const DEFAULT_FADE_SECONDS = "2.0";
 const LIBRARY_SEGMENT_FADE_SECONDS = "0.0";
+const DEFAULT_TRACK_UPLOAD_MODE: TrackUploadMode = "merged";
+const DEFAULT_TRACK_OUTPUT_GAIN = 1;
 
 type StatusTone = "info" | "success" | "error";
 type StatusMessage = { tone: StatusTone; text: string } | null;
 type DragLane = "queued";
 type DropLane = "approved" | "library" | null;
-type PlaybackMode = "source" | "final-preview";
 type ProcessedSegmentData = {
   id: string;
   left: Float32Array;
@@ -47,6 +48,8 @@ type ProcessedSegmentData = {
   sampleRate: number;
   sampleCount: number;
 };
+
+type EncodableAudioData = Pick<ProcessedSegmentData, "left" | "right" | "sampleRate" | "sampleCount">;
 
 const formatTime = (time: number) => {
   if (!Number.isFinite(time)) return "00:00.00";
@@ -156,6 +159,21 @@ const normalizeSegmentsForDuration = (segments: PersistedTrackSegment[], trackDu
   });
 };
 
+const areSegmentsEquivalent = (left: PersistedTrackSegment[], right: PersistedTrackSegment[]) =>
+  left.length === right.length &&
+  left.every((segment, index) => {
+    const other = right[index];
+
+    return (
+      other &&
+      segment.id === other.id &&
+      segment.start === other.start &&
+      segment.end === other.end &&
+      segment.fadeInInput === other.fadeInInput &&
+      segment.fadeOutInput === other.fadeOutInput
+    );
+  });
+
 const getReadablePath = (file: File) => {
   const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
   return relativePath && relativePath.trim().length > 0 ? relativePath : file.name;
@@ -178,6 +196,14 @@ const createDraftTrack = (file: File, sourceHash: string): PersistedEditorTrack 
   segments: [],
   approvedAt: null,
   segmentCount: null,
+  uploadMode: DEFAULT_TRACK_UPLOAD_MODE,
+  outputGain: DEFAULT_TRACK_OUTPUT_GAIN,
+});
+
+const normalizeEditorTrack = (track: PersistedEditorTrack): PersistedEditorTrack => ({
+  ...track,
+  uploadMode: track.uploadMode ?? DEFAULT_TRACK_UPLOAD_MODE,
+  outputGain: clamp(track.outputGain ?? DEFAULT_TRACK_OUTPUT_GAIN, 0, 1),
 });
 
 const getAudioContextCtor = () =>
@@ -208,6 +234,7 @@ const buildProcessedSegmentData = ({
   end,
   fadeInSeconds,
   fadeOutSeconds,
+  gainMultiplier = DEFAULT_TRACK_OUTPUT_GAIN,
 }: {
   segmentId: string;
   audioBuffer: AudioBuffer;
@@ -215,6 +242,7 @@ const buildProcessedSegmentData = ({
   end: number;
   fadeInSeconds: number;
   fadeOutSeconds: number;
+  gainMultiplier?: number;
 }): ProcessedSegmentData => {
   const startSample = Math.floor(start * audioBuffer.sampleRate);
   const endSample = Math.floor(end * audioBuffer.sampleRate);
@@ -246,8 +274,8 @@ const buildProcessedSegmentData = ({
       gain = Math.min(gain, fadeOutGain);
     }
 
-    left[index] *= gain;
-    right[index] *= gain;
+    left[index] *= gain * gainMultiplier;
+    right[index] *= gain * gainMultiplier;
   }
 
   return {
@@ -259,7 +287,7 @@ const buildProcessedSegmentData = ({
   };
 };
 
-const encodeMp3Segment = (segment: ProcessedSegmentData) => {
+const encodeMp3Segment = (segment: EncodableAudioData) => {
   const lamejs = (window as Window & typeof globalThis & { lamejs?: any }).lamejs;
   if (!lamejs) {
     throw new Error("MP3 encoder failed to load.");
@@ -296,32 +324,6 @@ const encodeMp3Segment = (segment: ProcessedSegmentData) => {
 
   return new Blob(mp3Data, { type: "audio/mpeg" });
 };
-
-const createProcessedSegment = ({
-  audioBuffer,
-  segmentId,
-  start,
-  end,
-  fadeInSeconds,
-  fadeOutSeconds,
-}: {
-  audioBuffer: AudioBuffer;
-  segmentId: string;
-  start: number;
-  end: number;
-  fadeInSeconds: number;
-  fadeOutSeconds: number;
-}) =>
-  encodeMp3Segment(
-    buildProcessedSegmentData({
-      segmentId,
-      audioBuffer,
-      start,
-      end,
-      fadeInSeconds,
-      fadeOutSeconds,
-    }),
-  );
 
 const mergeProcessedSegments = (segments: ProcessedSegmentData[]) => {
   if (!segments.length) {
@@ -364,7 +366,7 @@ const writeWavLabel = (view: DataView, offset: number, text: string) => {
   }
 };
 
-const encodeWavPreview = (segment: ReturnType<typeof mergeProcessedSegments>) => {
+const encodeWavPreview = (segment: EncodableAudioData) => {
   const channelCount = 2;
   const bytesPerSample = 2;
   const blockAlign = channelCount * bytesPerSample;
@@ -399,7 +401,7 @@ const encodeWavPreview = (segment: ReturnType<typeof mergeProcessedSegments>) =>
 
 export default function EditorPage() {
   const { user, loading } = useAuth();
-  const { setDockState } = useEditorAudioDock();
+  const setDockState = useSetEditorAudioDock();
 
   const [queuedTracks, setQueuedTracks] = useState<PersistedEditorTrack[]>([]);
   const [approvedTracks, setApprovedTracks] = useState<PersistedEditorTrack[]>([]);
@@ -414,17 +416,7 @@ export default function EditorPage() {
   const [isQueueing, setIsQueueing] = useState(false);
   const [isSavingDraft, setIsSavingDraft] = useState(false);
   const [isClearingDraft, setIsClearingDraft] = useState(false);
-  const [playbackMode, setPlaybackMode] = useState<PlaybackMode>("source");
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [editorVolume, setEditorVolume] = useState(0.92);
   const [isEditorMuted, setIsEditorMuted] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
-  const [isFinalPreviewLoading, setIsFinalPreviewLoading] = useState(false);
-  const [isFinalPreviewPlaying, setIsFinalPreviewPlaying] = useState(false);
-  const [finalPreviewCurrentTime, setFinalPreviewCurrentTime] = useState(0);
-  const [finalPreviewDuration, setFinalPreviewDuration] = useState(0);
-  const [finalPreviewOverlays, setFinalPreviewOverlays] = useState<EditorDockOverlay[]>([]);
   const [duplicateLibraryHashes, setDuplicateLibraryHashes] = useState<string[]>([]);
   const [recentQueuedIds, setRecentQueuedIds] = useState<string[]>([]);
   const [activeDropLane, setActiveDropLane] = useState<DropLane>(null);
@@ -435,15 +427,6 @@ export default function EditorPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const waveformRef = useRef<HTMLDivElement>(null);
-  const wavesurferRef = useRef<WaveSurfer | null>(null);
-  const regionsRef = useRef<any>(null);
-  const regionMapRef = useRef<Map<string, any>>(new Map());
-  const selectedTrackIdRef = useRef<string | null>(null);
-  const segmentsRef = useRef<PersistedTrackSegment[]>([]);
-  const activeSegmentIdRef = useRef<string | null>(null);
-  const previewSegmentEndRef = useRef<number | null>(null);
-  const finalPreviewAudioRef = useRef<HTMLAudioElement | null>(null);
-  const finalPreviewUrlRef = useRef<string | null>(null);
 
   const usesRemoteUpload =
     Boolean(user?.id) &&
@@ -456,21 +439,15 @@ export default function EditorPage() {
     () => queuedTracks.find((track) => track.id === selectedQueuedId) ?? queuedTracks[0] ?? null,
     [queuedTracks, selectedQueuedId],
   );
+  const selectedTrackFile = selectedTrack?.file ?? null;
+  const selectedTrackId = selectedTrack?.id ?? null;
+  const editorOutputGain = selectedTrack?.outputGain ?? DEFAULT_TRACK_OUTPUT_GAIN;
+  const deferredEditorOutputGain = useDeferredValue(editorOutputGain);
 
   const orderedSegments = useMemo(
     () => [...(selectedTrack?.segments ?? [])].sort((left, right) => left.start - right.start),
     [selectedTrack?.segments],
   );
-
-  const activeSegment =
-    orderedSegments.find((segment) => segment.id === selectedTrack?.activeSegmentId) ?? orderedSegments[0] ?? null;
-
-  const activeFinalPreviewOverlayId =
-    finalPreviewOverlays.find((overlay) => finalPreviewCurrentTime >= overlay.start && finalPreviewCurrentTime <= overlay.end)?.id ?? null;
-
-  const displayCurrentTime = playbackMode === "final-preview" ? finalPreviewCurrentTime : currentTime;
-  const displayDuration = playbackMode === "final-preview" ? finalPreviewDuration : duration;
-  const displayIsPlaying = playbackMode === "final-preview" ? isFinalPreviewPlaying : isPlaying;
 
   const librarySources = useMemo(() => {
     const queuedHashes = new Set(queuedTracks.map((track) => track.sourceHash));
@@ -492,12 +469,6 @@ export default function EditorPage() {
   }, [queuedTracks, selectedQueuedId]);
 
   useEffect(() => {
-    selectedTrackIdRef.current = selectedTrack?.id ?? null;
-    segmentsRef.current = selectedTrack?.segments ?? [];
-    activeSegmentIdRef.current = selectedTrack?.activeSegmentId ?? selectedTrack?.segments[0]?.id ?? null;
-  }, [selectedTrack?.activeSegmentId, selectedTrack?.id, selectedTrack?.segments]);
-
-  useEffect(() => {
     if (!folderInputRef.current) return;
 
     folderInputRef.current.setAttribute("webkitdirectory", "");
@@ -515,10 +486,10 @@ export default function EditorPage() {
           return;
         }
 
-        setQueuedTracks(snapshot.queuedTracks ?? []);
+        setQueuedTracks((snapshot.queuedTracks ?? []).map(normalizeEditorTrack));
         setApprovedTracks(
           (snapshot.approvedTracks ?? []).map((track) => ({
-            ...track,
+            ...normalizeEditorTrack(track),
             uploadState: track.uploadState ?? (track.approvedAt ? "synced" : "pending"),
           })),
         );
@@ -587,254 +558,139 @@ export default function EditorPage() {
     };
   }, [loading, user?.id, usesRemoteUpload]);
 
-  const applyRegionStyles = (selectedId: string | null) => {
-    for (const [segmentId, region] of regionMapRef.current.entries()) {
-      region.setOptions?.({
-        color: segmentId === selectedId ? "rgba(211, 170, 78, 0.24)" : "rgba(127, 167, 217, 0.18)",
-      });
-    }
-  };
-
   const updateQueuedTrack = (trackId: string, updater: (track: PersistedEditorTrack) => PersistedEditorTrack) => {
-    setQueuedTracks((currentTracks) =>
-      currentTracks.map((track) => (track.id === trackId ? updater(track) : track)),
-    );
+    setQueuedTracks((currentTracks) => {
+      let hasChanged = false;
+
+      const nextTracks = currentTracks.map((track) => {
+        if (track.id !== trackId) {
+          return track;
+        }
+
+        const nextTrack = updater(track);
+        if (nextTrack !== track) {
+          hasChanged = true;
+        }
+
+        return nextTrack;
+      });
+
+      return hasChanged ? nextTracks : currentTracks;
+    });
   };
 
   const updateApprovedTrack = (trackId: string, updater: (track: PersistedEditorTrack) => PersistedEditorTrack) => {
-    setApprovedTracks((currentTracks) =>
-      currentTracks.map((track) => (track.id === trackId ? updater(track) : track)),
-    );
+    setApprovedTracks((currentTracks) => {
+      let hasChanged = false;
+
+      const nextTracks = currentTracks.map((track) => {
+        if (track.id !== trackId) {
+          return track;
+        }
+
+        const nextTrack = updater(track);
+        if (nextTrack !== track) {
+          hasChanged = true;
+        }
+
+        return nextTrack;
+      });
+
+      return hasChanged ? nextTracks : currentTracks;
+    });
   };
+  const persistSelectedTrackActiveSegment = useCallback(
+    (segmentId: string | null) => {
+      if (!selectedTrackId) {
+        return;
+      }
 
-  const resetFinalPreview = useCallback(() => {
-    const audio = finalPreviewAudioRef.current;
-    if (audio) {
-      audio.pause();
-      audio.ontimeupdate = null;
-      audio.onloadedmetadata = null;
-      audio.onplay = null;
-      audio.onpause = null;
-      audio.onended = null;
-      audio.removeAttribute("src");
-      finalPreviewAudioRef.current = null;
-    }
+      updateQueuedTrack(selectedTrackId, (track) =>
+        track.activeSegmentId === segmentId
+          ? track
+          : {
+              ...track,
+              activeSegmentId: segmentId,
+            },
+      );
+    },
+    [selectedTrackId],
+  );
 
-    if (finalPreviewUrlRef.current) {
-      URL.revokeObjectURL(finalPreviewUrlRef.current);
-      finalPreviewUrlRef.current = null;
-    }
+  const persistSelectedTrackNormalizedSegments = useCallback(
+    (nextSegments: PersistedTrackSegment[], nextActiveSegmentId: string | null) => {
+      if (!selectedTrackId) {
+        return;
+      }
 
-    setPlaybackMode("source");
-    setIsFinalPreviewLoading(false);
-    setIsFinalPreviewPlaying(false);
-    setFinalPreviewCurrentTime(0);
-    setFinalPreviewDuration(0);
-    setFinalPreviewOverlays([]);
+      updateQueuedTrack(selectedTrackId, (track) =>
+        areSegmentsEquivalent(track.segments, nextSegments) && track.activeSegmentId === nextActiveSegmentId
+          ? track
+          : {
+              ...track,
+              segments: nextSegments,
+              activeSegmentId: nextActiveSegmentId,
+            },
+      );
+    },
+    [selectedTrackId],
+  );
+
+  const persistSelectedTrackSegmentBounds = useCallback(
+    (nextSegments: PersistedTrackSegment[]) => {
+      if (!selectedTrackId) {
+        return;
+      }
+
+      updateQueuedTrack(selectedTrackId, (track) =>
+        areSegmentsEquivalent(track.segments, nextSegments)
+          ? track
+          : {
+              ...track,
+              segments: nextSegments,
+            },
+      );
+    },
+    [selectedTrackId],
+  );
+
+  const handlePlaybackError = useCallback((message: string) => {
+    setStatusMessage({ tone: "error", text: message });
   }, []);
 
-  const clearSegmentPreview = () => {
-    previewSegmentEndRef.current = null;
-  };
+  const playbackController = useEditorPlaybackController({
+    trackId: selectedTrackId,
+    file: selectedTrackFile,
+    segments: orderedSegments,
+    persistedActiveSegmentId: selectedTrack?.activeSegmentId ?? null,
+    outputGain: deferredEditorOutputGain,
+    isMuted: isEditorMuted,
+    waveformRef,
+    onPersistActiveSegment: persistSelectedTrackActiveSegment,
+    onPersistNormalizedSegments: persistSelectedTrackNormalizedSegments,
+    onPersistSegmentBounds: persistSelectedTrackSegmentBounds,
+    onError: handlePlaybackError,
+  });
 
-  const setTrackActiveSegment = (trackId: string, segmentId: string | null) => {
-    updateQueuedTrack(trackId, (track) => ({
-      ...track,
-      activeSegmentId: segmentId,
-    }));
-  };
-
-  const syncActiveSegmentForTime = (time: number) => {
-    const trackId = selectedTrackIdRef.current;
-    if (!trackId) return;
-
-    const containingSegment = segmentsRef.current.find((segment) => time >= segment.start && time <= segment.end);
-    if (!containingSegment || containingSegment.id === activeSegmentIdRef.current) {
-      return;
-    }
-
-    activeSegmentIdRef.current = containingSegment.id;
-    setTrackActiveSegment(trackId, containingSegment.id);
-    applyRegionStyles(containingSegment.id);
-  };
-
-  const createWaveRegion = (segment: PersistedTrackSegment, plugin: any) => {
-    const region = plugin.addRegion({
-      id: segment.id,
-      start: segment.start,
-      end: segment.end,
-      drag: true,
-      resize: true,
-      color: segment.id === activeSegmentIdRef.current ? "rgba(211, 170, 78, 0.24)" : "rgba(127, 167, 217, 0.18)",
-    });
-
-    regionMapRef.current.set(segment.id, region);
-    return region;
-  };
-
-  useEffect(() => {
-    activeSegmentIdRef.current = selectedTrack?.activeSegmentId ?? null;
-    applyRegionStyles(selectedTrack?.activeSegmentId ?? null);
-  }, [selectedTrack?.activeSegmentId]);
-
-  useEffect(() => {
-    resetFinalPreview();
-  }, [orderedSegments, resetFinalPreview, selectedTrack?.id]);
-
-  useEffect(() => {
-    const file = selectedTrack?.file;
-
-    clearSegmentPreview();
-    regionMapRef.current.clear();
-    wavesurferRef.current?.destroy();
-    wavesurferRef.current = null;
-    regionsRef.current = null;
-
-    if (!file || !waveformRef.current) {
-      setIsPlaying(false);
-      setCurrentTime(0);
-      setDuration(0);
-      return;
-    }
-
-    setIsPlaying(false);
-    setCurrentTime(0);
-    setDuration(0);
-
-    const objectUrl = URL.createObjectURL(file);
-    const waveSurfer = WaveSurfer.create({
-      container: waveformRef.current,
-      waveColor: "rgba(255, 255, 255, 0.16)",
-      progressColor: "#F2EADC",
-      cursorColor: "#D3AA4E",
-      barWidth: 2,
-      barGap: 1,
-      barRadius: 1,
-      normalize: true,
-      height: WAVEFORM_HEIGHT,
-      url: objectUrl,
-    });
-    waveSurfer.setVolume(isEditorMuted ? 0 : editorVolume);
-
-    const waveRegions = waveSurfer.registerPlugin(RegionsPlugin.create());
-
-    waveSurfer.on("ready", (trackDuration) => {
-      const normalizedSegments = normalizeSegmentsForDuration(selectedTrack.segments, trackDuration);
-      const nextActiveSegmentId =
-        normalizedSegments.find((segment) => segment.id === selectedTrack.activeSegmentId)?.id ?? normalizedSegments[0]?.id ?? null;
-
-      updateQueuedTrack(selectedTrack.id, (track) => ({
-        ...track,
-        segments: normalizedSegments,
-        activeSegmentId: nextActiveSegmentId,
-      }));
-
-      segmentsRef.current = normalizedSegments;
-      activeSegmentIdRef.current = nextActiveSegmentId;
-
-      normalizedSegments.forEach((segment) => createWaveRegion(segment, waveRegions));
-      applyRegionStyles(nextActiveSegmentId);
-
-      const initialSegment = normalizedSegments.find((segment) => segment.id === nextActiveSegmentId) ?? normalizedSegments[0] ?? null;
-      if (initialSegment) {
-        waveSurfer.setTime(initialSegment.start);
-        setCurrentTime(initialSegment.start);
-      }
-
-      setDuration(trackDuration);
-    });
-
-    waveSurfer.on("audioprocess", (time) => {
-      setCurrentTime(time);
-      syncActiveSegmentForTime(time);
-
-      const previewSegmentEnd = previewSegmentEndRef.current;
-      if (previewSegmentEnd !== null && time >= previewSegmentEnd) {
-        clearSegmentPreview();
-        waveSurfer.pause();
-        waveSurfer.setTime(previewSegmentEnd);
-        setCurrentTime(previewSegmentEnd);
-      }
-    });
-
-    waveSurfer.on("interaction", () => {
-      const nextTime = waveSurfer.getCurrentTime();
-      resetFinalPreview();
-      clearSegmentPreview();
-      setCurrentTime(nextTime);
-      syncActiveSegmentForTime(nextTime);
-    });
-
-    waveSurfer.on("play", () => setIsPlaying(true));
-    waveSurfer.on("pause", () => setIsPlaying(false));
-    waveSurfer.on("finish", () => {
-      clearSegmentPreview();
-      setIsPlaying(false);
-    });
-
-    waveRegions.on("region-clicked", (region: any, event?: Event) => {
-      event?.stopPropagation?.();
-
-      const trackId = selectedTrackIdRef.current;
-      if (!trackId) return;
-
-      resetFinalPreview();
-      clearSegmentPreview();
-      setTrackActiveSegment(trackId, region.id);
-      activeSegmentIdRef.current = region.id;
-      applyRegionStyles(region.id);
-      waveSurfer.setTime(region.start);
-      setCurrentTime(region.start);
-    });
-
-    waveRegions.on("region-updated", (region: any) => {
-      const trackId = selectedTrackIdRef.current;
-      if (!trackId) return;
-
-      const nextSegments = segmentsRef.current.map((segment) =>
-        segment.id === region.id
-          ? {
-              ...segment,
-              start: region.start,
-              end: region.end,
-            }
-          : segment,
-      );
-
-      segmentsRef.current = nextSegments;
-
-      updateQueuedTrack(trackId, (track) => ({
-        ...track,
-        segments: nextSegments,
-      }));
-
-      if (region.id === activeSegmentIdRef.current) {
-        waveSurfer.setTime(region.start);
-        setCurrentTime(region.start);
-      }
-    });
-
-    wavesurferRef.current = waveSurfer;
-    regionsRef.current = waveRegions;
-
-    return () => {
-      regionMapRef.current.clear();
-      wavesurferRef.current = null;
-      regionsRef.current = null;
-      clearSegmentPreview();
-      waveSurfer.destroy();
-      URL.revokeObjectURL(objectUrl);
-    };
-  }, [resetFinalPreview, selectedTrack?.id]);
-
-  useEffect(() => {
-    wavesurferRef.current?.setVolume(isEditorMuted ? 0 : editorVolume);
-    const finalPreviewAudio = finalPreviewAudioRef.current;
-    if (!finalPreviewAudio) return;
-
-    finalPreviewAudio.volume = editorVolume;
-    finalPreviewAudio.muted = isEditorMuted;
-  }, [editorVolume, isEditorMuted]);
+  const playbackMode = playbackController.mode;
+  const displayCurrentTime = playbackController.displayCurrentTime;
+  const displayDuration = playbackController.displayDuration;
+  const displayIsPlaying = playbackController.displayIsPlaying;
+  const currentTime = playbackController.sourceCurrentTime;
+  const duration = playbackController.sourceDuration;
+  const isFinalPreviewLoading = playbackController.isFinalPreviewLoading;
+  const finalPreviewOverlays = playbackController.finalPreviewOverlays;
+  const activeFinalPreviewOverlayId = playbackController.activeFinalPreviewOverlayId;
+  const activeSegment = orderedSegments.find((segment) => segment.id === playbackController.activeSegmentId) ?? orderedSegments[0] ?? null;
+  const togglePlayback = playbackController.togglePlayback;
+  const seekTransport = playbackController.seekTransport;
+  const skipTransportBy = playbackController.skipTransportBy;
+  const jumpTransportOverlay = playbackController.jumpTransportOverlay;
+  const playFinalPreview = playbackController.playFinalPreview;
+  const previewSegment = playbackController.previewSegment;
+  const seekSource = playbackController.seekSource;
+  const pauseSource = playbackController.pauseSource;
+  const setSourceActiveSegment = playbackController.setSourceActiveSegment;
 
   const handleFadeInputChange =
     (segmentId: string, key: "fadeInInput" | "fadeOutInput") => (event: ChangeEvent<HTMLInputElement>) => {
@@ -863,217 +719,62 @@ export default function EditorPage() {
     }));
   };
 
-  const previewSegment = (segmentId: string) => {
-    const segment = segmentsRef.current.find((item) => item.id === segmentId);
-    if (!segment || !wavesurferRef.current) return;
-
+  const setSelectedTrackUploadMode = (uploadMode: TrackUploadMode) => {
     const trackId = selectedTrack?.id;
     if (!trackId) return;
 
-    resetFinalPreview();
-    setTrackActiveSegment(trackId, segmentId);
-    activeSegmentIdRef.current = segmentId;
-    applyRegionStyles(segmentId);
-    wavesurferRef.current.pause();
-    wavesurferRef.current.setTime(segment.start);
-    setCurrentTime(segment.start);
-    previewSegmentEndRef.current = segment.end;
-    void wavesurferRef.current.play();
+    updateQueuedTrack(trackId, (track) => ({
+      ...track,
+      uploadMode,
+    }));
   };
 
-  const seekTrack = (time: number) => {
-    const waveSurfer = wavesurferRef.current;
-    if (!waveSurfer || duration <= 0) return;
-
-    resetFinalPreview();
-    const nextTime = clamp(time, 0, duration);
-    clearSegmentPreview();
-    waveSurfer.setTime(nextTime);
-    setCurrentTime(nextTime);
-    syncActiveSegmentForTime(nextTime);
-  };
-
-  const skipTrackBy = (deltaSeconds: number) => {
-    seekTrack(currentTime + deltaSeconds);
-  };
-
-  const toggleTrackPlayback = () => {
-    const waveSurfer = wavesurferRef.current;
-    if (!waveSurfer || duration <= 0) return;
-
-    resetFinalPreview();
-    clearSegmentPreview();
-
-    if (isPlaying) {
-      waveSurfer.pause();
-      return;
-    }
-
-    void waveSurfer.play();
-  };
-
-  const jumpToSegment = (direction: -1 | 1) => {
-    if (!orderedSegments.length) return;
-
-    const currentSegmentIndex = orderedSegments.findIndex((segment) => segment.id === activeSegmentIdRef.current);
-    const fallbackIndex = orderedSegments.findIndex((segment) => currentTime < segment.end);
-    const seedIndex =
-      currentSegmentIndex >= 0 ? currentSegmentIndex : fallbackIndex >= 0 ? fallbackIndex : direction === 1 ? -1 : orderedSegments.length;
-    const nextIndex = clamp(seedIndex + direction, 0, orderedSegments.length - 1);
-    const nextSegment = orderedSegments[nextIndex];
+  const setSelectedTrackOutputGain = (nextGain: number) => {
     const trackId = selectedTrack?.id;
-    if (!trackId || !wavesurferRef.current) return;
+    if (!trackId) return;
 
-    resetFinalPreview();
-    clearSegmentPreview();
-    setTrackActiveSegment(trackId, nextSegment.id);
-    activeSegmentIdRef.current = nextSegment.id;
-    applyRegionStyles(nextSegment.id);
-    wavesurferRef.current.setTime(nextSegment.start);
-    setCurrentTime(nextSegment.start);
-  };
+    const safeGain = clamp(nextGain, 0, 1);
+    updateQueuedTrack(trackId, (track) => ({
+      ...track,
+      outputGain: safeGain,
+    }));
 
-  const seekFinalPreview = (time: number) => {
-    const audio = finalPreviewAudioRef.current;
-    if (!audio || finalPreviewDuration <= 0) return;
-
-    const nextTime = clamp(time, 0, finalPreviewDuration);
-    audio.currentTime = nextTime;
-    setFinalPreviewCurrentTime(nextTime);
-  };
-
-  const skipFinalPreviewBy = (deltaSeconds: number) => {
-    seekFinalPreview(finalPreviewCurrentTime + deltaSeconds);
-  };
-
-  const jumpToFinalPreviewOverlay = (direction: -1 | 1) => {
-    if (!finalPreviewOverlays.length) return;
-
-    const currentOverlayIndex = finalPreviewOverlays.findIndex((overlay) => overlay.id === activeFinalPreviewOverlayId);
-    const fallbackIndex = finalPreviewOverlays.findIndex((overlay) => finalPreviewCurrentTime < overlay.end);
-    const seedIndex =
-      currentOverlayIndex >= 0
-        ? currentOverlayIndex
-        : fallbackIndex >= 0
-          ? fallbackIndex
-          : direction === 1
-            ? -1
-            : finalPreviewOverlays.length;
-    const nextIndex = clamp(seedIndex + direction, 0, finalPreviewOverlays.length - 1);
-    seekFinalPreview(finalPreviewOverlays[nextIndex].start);
-  };
-
-  const toggleFinalPreviewPlayback = async () => {
-    const audio = finalPreviewAudioRef.current;
-    if (!audio) return;
-
-    if (isFinalPreviewPlaying) {
-      audio.pause();
-      return;
-    }
-
-    try {
-      await audio.play();
-    } catch (error) {
-      console.error("Final preview playback failed", error);
-      setIsFinalPreviewPlaying(false);
-      setStatusMessage({ tone: "error", text: "Failed to play the final preview." });
-    }
-  };
-
-  const playFinalPreview = async () => {
-    if (!selectedTrack) return;
-
-    const trackSegments = [...orderedSegments].sort((left, right) => left.start - right.start);
-    if (!trackSegments.length) {
-      setStatusMessage({ tone: "info", text: "Add a segment before playing the final preview." });
-      return;
-    }
-
-    wavesurferRef.current?.pause();
-    clearSegmentPreview();
-    resetFinalPreview();
-    setIsFinalPreviewLoading(true);
-
-    try {
-      const audioBuffer = await decodeAudioFile(selectedTrack.file);
-      const processedSegments = trackSegments.map((segment) =>
-        buildProcessedSegmentData({
-          segmentId: segment.id,
-          audioBuffer,
-          start: segment.start,
-          end: segment.end,
-          fadeInSeconds: parseFadeSeconds(segment.fadeInInput),
-          fadeOutSeconds: parseFadeSeconds(segment.fadeOutInput),
-        }),
-      );
-      const mergedPreview = mergeProcessedSegments(processedSegments);
-      const previewUrl = URL.createObjectURL(encodeWavPreview(mergedPreview));
-      const previewAudio = new Audio(previewUrl);
-      const previewDuration = mergedPreview.sampleCount / mergedPreview.sampleRate;
-
-      finalPreviewUrlRef.current = previewUrl;
-      finalPreviewAudioRef.current = previewAudio;
-      previewAudio.preload = "metadata";
-      previewAudio.volume = editorVolume;
-      previewAudio.muted = isEditorMuted;
-      previewAudio.ontimeupdate = () => {
-        setFinalPreviewCurrentTime(previewAudio.currentTime);
-      };
-      previewAudio.onloadedmetadata = () => {
-        setFinalPreviewDuration(Number.isFinite(previewAudio.duration) ? previewAudio.duration : previewDuration);
-      };
-      previewAudio.onplay = () => {
-        setPlaybackMode("final-preview");
-        setIsFinalPreviewPlaying(true);
-        setIsFinalPreviewLoading(false);
-      };
-      previewAudio.onpause = () => {
-        if (!previewAudio.ended) {
-          setIsFinalPreviewPlaying(false);
-        }
-      };
-      previewAudio.onended = () => {
-        setIsFinalPreviewPlaying(false);
-        setFinalPreviewCurrentTime(Number.isFinite(previewAudio.duration) ? previewAudio.duration : previewDuration);
-      };
-
-      setPlaybackMode("final-preview");
-      setFinalPreviewOverlays(mergedPreview.overlays);
-      setFinalPreviewCurrentTime(0);
-      setFinalPreviewDuration(previewDuration);
-
-      await previewAudio.play();
-    } catch (error) {
-      resetFinalPreview();
-      setStatusMessage({
-        tone: "error",
-        text: error instanceof Error ? error.message : "Failed to build the final preview.",
-      });
-    } finally {
-      setIsFinalPreviewLoading(false);
+    if (safeGain > 0 && isEditorMuted) {
+      setIsEditorMuted(false);
     }
   };
 
   useEffect(() => {
+    const handleSpacebarToggle = (event: KeyboardEvent) => {
+      if (event.code !== "Space" || event.repeat || event.altKey || event.ctrlKey || event.metaKey) {
+        return;
+      }
+
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(target.tagName))
+      ) {
+        return;
+      }
+
+      const canToggle = playbackMode === "final-preview" ? displayDuration > 0 : duration > 0;
+      if (!canToggle) {
+        return;
+      }
+
+      event.preventDefault();
+      void togglePlayback();
+    };
+
+    window.addEventListener("keydown", handleSpacebarToggle);
     return () => {
-      const audio = finalPreviewAudioRef.current;
-      if (audio) {
-        audio.pause();
-        audio.ontimeupdate = null;
-        audio.onloadedmetadata = null;
-        audio.onplay = null;
-        audio.onpause = null;
-        audio.onended = null;
-        audio.removeAttribute("src");
-        finalPreviewAudioRef.current = null;
-      }
+      window.removeEventListener("keydown", handleSpacebarToggle);
+    };
+  }, [displayDuration, duration, playbackMode, togglePlayback]);
 
-      if (finalPreviewUrlRef.current) {
-        URL.revokeObjectURL(finalPreviewUrlRef.current);
-        finalPreviewUrlRef.current = null;
-      }
-
+  useEffect(() => {
+    return () => {
       setDockState(null);
     };
   }, [setDockState]);
@@ -1087,7 +788,7 @@ export default function EditorPage() {
       isPlaying: displayIsPlaying,
       currentTime: displayCurrentTime,
       duration: displayDuration,
-      volume: editorVolume,
+      volume: editorOutputGain,
       isMuted: isEditorMuted,
       overlays:
         playbackMode === "final-preview"
@@ -1102,19 +803,13 @@ export default function EditorPage() {
               isActive: segment.id === activeSegment?.id,
             })),
       activeOverlayId: playbackMode === "final-preview" ? activeFinalPreviewOverlayId : activeSegment?.id ?? null,
-      onToggle: playbackMode === "final-preview" ? toggleFinalPreviewPlayback : toggleTrackPlayback,
-      onSeek: playbackMode === "final-preview" ? seekFinalPreview : seekTrack,
-      onSkipBack: playbackMode === "final-preview" ? () => skipFinalPreviewBy(-5) : () => skipTrackBy(-5),
-      onSkipForward: playbackMode === "final-preview" ? () => skipFinalPreviewBy(5) : () => skipTrackBy(5),
-      onJumpToPreviousOverlay: playbackMode === "final-preview" ? () => jumpToFinalPreviewOverlay(-1) : () => jumpToSegment(-1),
-      onJumpToNextOverlay: playbackMode === "final-preview" ? () => jumpToFinalPreviewOverlay(1) : () => jumpToSegment(1),
-      onSetVolume: (nextVolume) => {
-        const safeVolume = clamp(nextVolume, 0, 1);
-        setEditorVolume(safeVolume);
-        if (safeVolume > 0 && isEditorMuted) {
-          setIsEditorMuted(false);
-        }
-      },
+      onToggle: togglePlayback,
+      onSeek: seekTransport,
+      onSkipBack: () => skipTransportBy(-5),
+      onSkipForward: () => skipTransportBy(5),
+      onJumpToPreviousOverlay: () => jumpTransportOverlay(-1),
+      onJumpToNextOverlay: () => jumpTransportOverlay(1),
+      onSetVolume: setSelectedTrackOutputGain,
       onToggleMute: () => setIsEditorMuted((current) => !current),
     });
   }, [
@@ -1126,24 +821,26 @@ export default function EditorPage() {
     finalPreviewOverlays,
     currentTime,
     duration,
-    editorVolume,
+    editorOutputGain,
     isEditorMuted,
     orderedSegments,
     selectedTrack?.displayName,
+    selectedTrack?.id,
     playbackMode,
     setDockState,
+    seekTransport,
+    skipTransportBy,
+    jumpTransportOverlay,
+    togglePlayback,
   ]);
 
   const addSegment = () => {
     const trackId = selectedTrack?.id;
-    if (!trackId || !regionsRef.current || duration <= 0) return;
+    if (!trackId || duration <= 0) return;
 
-    clearSegmentPreview();
     const seedTime = activeSegment ? activeSegment.end : currentTime;
     const window = getSuggestedSegmentWindow(duration, seedTime);
     const nextSegment = createSegment(window.start, window.end);
-
-    segmentsRef.current = [...segmentsRef.current, nextSegment];
 
     updateQueuedTrack(trackId, (track) => ({
       ...track,
@@ -1151,28 +848,19 @@ export default function EditorPage() {
       activeSegmentId: nextSegment.id,
     }));
 
-    activeSegmentIdRef.current = nextSegment.id;
-    createWaveRegion(nextSegment, regionsRef.current);
-    applyRegionStyles(nextSegment.id);
-    wavesurferRef.current?.setTime(nextSegment.start);
-    setCurrentTime(nextSegment.start);
+    setSourceActiveSegment(nextSegment.id, {
+      persist: false,
+      seekTime: nextSegment.start,
+    });
   };
 
   const removeSegment = (segmentId: string) => {
     const trackId = selectedTrack?.id;
     if (!trackId) return;
 
-    clearSegmentPreview();
-    const nextSegments = segmentsRef.current.filter((segment) => segment.id !== segmentId);
+    const nextSegments = orderedSegments.filter((segment) => segment.id !== segmentId);
     const nextActiveSegmentId =
-      segmentId === activeSegmentIdRef.current ? nextSegments[0]?.id ?? null : activeSegmentIdRef.current;
-
-    const region = regionMapRef.current.get(segmentId);
-    region?.remove?.();
-    regionMapRef.current.delete(segmentId);
-
-    segmentsRef.current = nextSegments;
-    activeSegmentIdRef.current = nextActiveSegmentId;
+      segmentId === playbackController.activeSegmentId ? nextSegments[0]?.id ?? null : playbackController.activeSegmentId;
 
     updateQueuedTrack(trackId, (track) => ({
       ...track,
@@ -1180,17 +868,17 @@ export default function EditorPage() {
       activeSegmentId: nextActiveSegmentId,
     }));
 
-    applyRegionStyles(nextActiveSegmentId);
-
     if (!nextSegments.length) {
-      wavesurferRef.current?.pause();
-      setIsPlaying(false);
+      pauseSource();
+      seekSource(0);
       return;
     }
 
     const nextActiveSegment = nextSegments.find((segment) => segment.id === nextActiveSegmentId) ?? nextSegments[0];
-    wavesurferRef.current?.setTime(nextActiveSegment.start);
-    setCurrentTime(nextActiveSegment.start);
+    setSourceActiveSegment(nextActiveSegment.id, {
+      persist: false,
+      seekTime: nextActiveSegment.start,
+    });
   };
 
   const refreshInventory = async () => {
@@ -1219,20 +907,38 @@ export default function EditorPage() {
     }
 
     const audioBuffer = await decodeAudioFile(track.file);
-    await deleteHighlightSourceAssets(user.id, track.sourceHash);
-
-    for (const [index, segment] of trackSegments.entries()) {
-      const blob = createProcessedSegment({
-        audioBuffer,
+    const gainMultiplier = clamp(track.outputGain ?? DEFAULT_TRACK_OUTPUT_GAIN, 0, 1);
+    const processedSegments = trackSegments.map((segment) =>
+      buildProcessedSegmentData({
         segmentId: segment.id,
+        audioBuffer,
         start: segment.start,
         end: segment.end,
         fadeInSeconds: parseFadeSeconds(segment.fadeInInput),
         fadeOutSeconds: parseFadeSeconds(segment.fadeOutInput),
+        gainMultiplier,
+      }),
+    );
+
+    await deleteHighlightSourceAssets(user.id, track.sourceHash);
+
+    if ((track.uploadMode ?? DEFAULT_TRACK_UPLOAD_MODE) === "merged") {
+      const storagePath = buildSegmentStoragePath(user.id, track.sourceHash, track.displayName, 0);
+      const { error } = await supabase.storage.from("highlights").upload(storagePath, encodeMp3Segment(mergeProcessedSegments(processedSegments)), {
+        contentType: "audio/mpeg",
+        upsert: true,
       });
 
+      if (error) {
+        throw error;
+      }
+
+      return trackSegments.length;
+    }
+
+    for (const [index, segment] of processedSegments.entries()) {
       const storagePath = buildSegmentStoragePath(user.id, track.sourceHash, track.displayName, index);
-      const { error } = await supabase.storage.from("highlights").upload(storagePath, blob, {
+      const { error } = await supabase.storage.from("highlights").upload(storagePath, encodeMp3Segment(segment), {
         contentType: "audio/mpeg",
         upsert: true,
       });
@@ -1296,7 +1002,7 @@ export default function EditorPage() {
         return nextSegment;
       });
 
-      const loadedTrack: PersistedEditorTrack = {
+      const loadedTrack = normalizeEditorTrack({
         ...createDraftTrack(file, source.sourceHash),
         displayName: source.sourceName,
         relativePath: source.sampleStoragePath,
@@ -1305,7 +1011,8 @@ export default function EditorPage() {
         approvedAt: source.uploadedAt,
         segmentCount: reconstructedSegments.length,
         uploadState: "synced",
-      };
+        uploadMode: sourceTracks.length > 1 ? "separate" : "merged",
+      });
 
       setApprovedTracks((current) => [loadedTrack, ...current.filter((item) => item.sourceHash !== source.sourceHash)]);
       setDuplicateLibraryHashes((current) => current.filter((hash) => hash !== source.sourceHash));
@@ -1778,8 +1485,9 @@ export default function EditorPage() {
                   {isInventorySyncing ? "Syncing…" : "Queue a track"}
                 </div>
               ) : (
-                <div className="mt-4 grid min-h-0 flex-1 gap-3 xl:grid-cols-[minmax(0,1.3fr)_minmax(250px,0.72fr)]">
-                  <div className="min-h-0 rounded-[26px] border border-white/10 bg-black/18 p-3">
+                <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
+                  <div className="grid gap-3 xl:grid-cols-[minmax(0,1.3fr)_minmax(250px,0.72fr)]">
+                  <div className="flex min-h-0 flex-col rounded-[26px] border border-white/10 bg-black/18 p-3">
                     <div className="relative overflow-hidden rounded-[18px]" style={{ height: `${WAVEFORM_HEIGHT}px` }}>
                       <div ref={waveformRef} className="relative z-10 h-full w-full" />
 
@@ -1847,7 +1555,7 @@ export default function EditorPage() {
                       </button>
                       <button
                         type="button"
-                        onClick={() => void (playbackMode === "final-preview" && finalPreviewAudioRef.current ? toggleFinalPreviewPlayback() : playFinalPreview())}
+                        onClick={() => void (playbackMode === "final-preview" ? togglePlayback() : playFinalPreview())}
                         disabled={isFinalPreviewLoading || !orderedSegments.length}
                         className="inline-flex items-center gap-2 rounded-full border border-accent-blue/20 bg-accent-blue/10 px-4 py-2 text-sm text-accent-blue transition-colors hover:bg-accent-blue/16 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.03] disabled:text-text-dim"
                       >
@@ -1863,6 +1571,43 @@ export default function EditorPage() {
                         <Check className="h-4 w-4" />
                         Approve selected
                       </button>
+                    </div>
+
+                    <div className="mt-3 flex flex-col gap-3 rounded-[20px] border border-white/10 bg-white/[0.03] px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <div className="font-sans text-[11px] uppercase tracking-[0.16em] text-text-dim">Upload mode</div>
+                        <div className="mt-2 inline-flex rounded-full border border-white/10 bg-black/20 p-1">
+                          <button
+                            type="button"
+                            onClick={() => setSelectedTrackUploadMode("merged")}
+                            className={cn(
+                              "rounded-full px-3 py-1.5 text-xs transition-colors",
+                              (selectedTrack.uploadMode ?? DEFAULT_TRACK_UPLOAD_MODE) === "merged"
+                                ? "bg-accent-gold/14 text-accent-gold"
+                                : "text-text-dim hover:text-text-main",
+                            )}
+                          >
+                            Join clips
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setSelectedTrackUploadMode("separate")}
+                            className={cn(
+                              "rounded-full px-3 py-1.5 text-xs transition-colors",
+                              (selectedTrack.uploadMode ?? DEFAULT_TRACK_UPLOAD_MODE) === "separate"
+                                ? "bg-accent-blue/14 text-accent-blue"
+                                : "text-text-dim hover:text-text-main",
+                            )}
+                          >
+                            Separate clips
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 text-xs text-text-dim">
+                        <Badge variant="dim">{Math.round(editorOutputGain * 100)}% output</Badge>
+                        <span>Space toggles playback</span>
+                      </div>
                     </div>
                   </div>
 
@@ -1944,6 +1689,7 @@ export default function EditorPage() {
                         })
                       )}
                     </div>
+                  </div>
                   </div>
                 </div>
               )}

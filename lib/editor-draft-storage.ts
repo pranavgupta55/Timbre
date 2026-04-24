@@ -6,6 +6,8 @@ export type PersistedTrackSegment = {
   fadeOutInput: string;
 };
 
+export type TrackUploadMode = "merged" | "separate";
+
 export type PersistedEditorTrack = {
   id: string;
   file: File;
@@ -18,6 +20,8 @@ export type PersistedEditorTrack = {
   approvedAt?: string | null;
   segmentCount?: number | null;
   uploadState?: "pending" | "syncing" | "synced" | "error";
+  uploadMode?: TrackUploadMode;
+  outputGain?: number;
 };
 
 export type EditorDraftSnapshot = {

@@ -140,9 +140,11 @@ export async function fetchHighlightInventory(userId: string) {
     (left, right) => new Date(right.uploadedAt).getTime() - new Date(left.uploadedAt).getTime(),
   );
 
+  const sourceOrder = new Map(sources.map((source, index) => [source.sourceHash, index]));
+
   tracks.sort((left, right) => {
-    const timeDelta = new Date(right.uploadedAt).getTime() - new Date(left.uploadedAt).getTime();
-    return timeDelta !== 0 ? timeDelta : left.segmentIndex - right.segmentIndex;
+    const sourceDelta = (sourceOrder.get(left.sourceHash) ?? 0) - (sourceOrder.get(right.sourceHash) ?? 0);
+    return sourceDelta !== 0 ? sourceDelta : left.segmentIndex - right.segmentIndex;
   });
 
   return { sources, tracks };

@@ -17,7 +17,7 @@ import {
 } from "lucide-react";
 import { useMemo, type ReactNode } from "react";
 import { useAudio } from "@/context/AudioContext";
-import { useEditorAudioDock } from "@/context/EditorAudioDockContext";
+import { useEditorAudioDockState } from "@/context/EditorAudioDockContext";
 import { cn } from "@/lib/utils";
 
 const formatTime = (value: number) => {
@@ -103,7 +103,7 @@ function VolumeControl({
         step={0.01}
         value={volume}
         onChange={(event) => onSetVolume(Number.parseFloat(event.target.value))}
-        className="h-1.5 w-24 cursor-pointer appearance-none rounded-full bg-white/10 accent-accent-gold"
+        className="timbre-range timbre-range-volume block h-4 w-24 cursor-pointer"
         aria-label="Volume"
       />
     </div>
@@ -154,7 +154,7 @@ function TransportTimeline({
           step={0.1}
           value={currentTime || 0}
           onChange={(event) => onSeek(Number.parseFloat(event.target.value))}
-          className="relative z-10 h-6 w-full cursor-pointer appearance-none bg-transparent accent-accent-gold"
+          className="timbre-range timbre-range-seek absolute inset-x-0 top-1/2 z-10 block h-4 -translate-y-1/2 cursor-pointer"
           aria-label="Seek"
         />
       </div>
@@ -256,7 +256,7 @@ export function AudioDock() {
     setVolume,
     toggleMute,
   } = useAudio();
-  const { dockState } = useEditorAudioDock();
+  const dockState = useEditorAudioDockState();
 
   const queueCount = useMemo(
     () => manualQueue.length + Math.max(contextTracks.length - currentIndex - 1, 0),

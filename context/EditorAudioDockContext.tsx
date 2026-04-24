@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
+import { createContext, useContext, useRef, useSyncExternalStore, type ReactNode } from "react";
 
 export type EditorDockOverlay = {
   id: string;
@@ -31,32 +31,71 @@ export type EditorAudioDockState = {
   onToggleMute: () => void;
 };
 
-type EditorAudioDockContextValue = {
-  dockState: EditorAudioDockState | null;
-  setDockState: (state: EditorAudioDockState | null) => void;
+type EditorAudioDockStore = {
+  getSnapshot: () => EditorAudioDockState | null;
+  setState: (state: EditorAudioDockState | null) => void;
+  subscribe: (listener: () => void) => () => void;
 };
 
-const EditorAudioDockContext = createContext<EditorAudioDockContextValue | null>(null);
+const createEditorAudioDockStore = (): EditorAudioDockStore => {
+  let dockState: EditorAudioDockState | null = null;
+  const listeners = new Set<() => void>();
+
+  return {
+    getSnapshot: () => dockState,
+    setState: (nextState) => {
+      if (Object.is(dockState, nextState)) {
+        return;
+      }
+
+      dockState = nextState;
+      listeners.forEach((listener) => listener());
+    },
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+};
+
+const EditorAudioDockStoreContext = createContext<EditorAudioDockStore | undefined>(undefined);
+const EditorAudioDockDispatchContext = createContext<((state: EditorAudioDockState | null) => void) | undefined>(undefined);
 
 export function EditorAudioDockProvider({ children }: { children: ReactNode }) {
-  const [dockState, setDockState] = useState<EditorAudioDockState | null>(null);
+  const storeRef = useRef<EditorAudioDockStore | null>(null);
 
-  const value = useMemo(
-    () => ({
-      dockState,
-      setDockState,
-    }),
-    [dockState],
+  if (!storeRef.current) {
+    storeRef.current = createEditorAudioDockStore();
+  }
+
+  return (
+    <EditorAudioDockDispatchContext.Provider value={storeRef.current.setState}>
+      <EditorAudioDockStoreContext.Provider value={storeRef.current}>{children}</EditorAudioDockStoreContext.Provider>
+    </EditorAudioDockDispatchContext.Provider>
   );
-
-  return <EditorAudioDockContext.Provider value={value}>{children}</EditorAudioDockContext.Provider>;
 }
 
-export const useEditorAudioDock = () => {
-  const context = useContext(EditorAudioDockContext);
-  if (!context) {
-    throw new Error("useEditorAudioDock must be used within an EditorAudioDockProvider");
+export const useEditorAudioDockState = () => {
+  const store = useContext(EditorAudioDockStoreContext);
+  if (store === undefined) {
+    throw new Error("useEditorAudioDockState must be used within an EditorAudioDockProvider");
+  }
+
+  return useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+};
+
+export const useSetEditorAudioDock = () => {
+  const context = useContext(EditorAudioDockDispatchContext);
+  if (context === undefined) {
+    throw new Error("useSetEditorAudioDock must be used within an EditorAudioDockProvider");
   }
 
   return context;
 };
+
+export const useEditorAudioDock = () => ({
+  dockState: useEditorAudioDockState(),
+  setDockState: useSetEditorAudioDock(),
+});

@@ -67,7 +67,7 @@ export default function ReelPage() {
   }, [deferredSearch, tracks]);
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-4">
+    <div className="flex h-full min-h-0 flex-col gap-4 overflow-y-auto pb-2">
       <div className="min-w-0">
         <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-accent-red">Player</div>
         <h1 className="mt-1 truncate font-serif text-2xl text-text-main sm:text-4xl">Highlights</h1>

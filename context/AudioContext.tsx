@@ -10,6 +10,9 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { useAuth } from "@/context/AuthContext";
+import { fetchHighlightInventory } from "@/lib/highlights";
+import { playMediaSafely } from "@/lib/media-playback";
 import { supabase } from "@/lib/supabase";
 
 export interface Track {
@@ -91,8 +94,10 @@ export const useAudio = () => {
 };
 
 export function AudioProvider({ children }: { children: ReactNode }) {
+  const { user, loading } = useAuth();
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const shouldBePlayingRef = useRef(false);
+  const seededUserIdRef = useRef<string | null>(null);
 
   const [contextTracks, setContextTracks] = useState<Track[]>([]);
   const [originalContextTracks, setOriginalContextTracks] = useState<Track[]>([]);
@@ -103,7 +108,7 @@ export function AudioProvider({ children }: { children: ReactNode }) {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [isShuffle, setIsShuffle] = useState(true);
+  const [isShuffle, setIsShuffle] = useState(false);
   const [repeatMode, setRepeatMode] = useState<RepeatMode>("off");
   const [volume, setVolumeState] = useState(0.92);
   const [isMuted, setIsMuted] = useState(false);
@@ -143,22 +148,12 @@ export function AudioProvider({ children }: { children: ReactNode }) {
   );
 
   const play = useCallback(async () => {
-    const audio = audioRef.current;
-    if (!audio) return;
-
     if (!currentTrack && contextTracks.length > 0) {
       selectContextTrack(currentIndex >= 0 ? currentIndex : 0, true);
       return;
     }
 
     setIsPlaying(true);
-
-    try {
-      await audio.play();
-    } catch (error) {
-      console.error("Audio play failed", error);
-      setIsPlaying(false);
-    }
   }, [contextTracks.length, currentIndex, currentTrack, selectContextTrack]);
 
   const pause = useCallback(() => {
@@ -384,10 +379,17 @@ export function AudioProvider({ children }: { children: ReactNode }) {
       if (!currentTrack) {
         audio.pause();
         audio.removeAttribute("src");
+        audio.load();
         setCurrentTime(0);
         setDuration(0);
         return;
       }
+
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+      setCurrentTime(0);
+      setDuration(0);
 
       const { data, error } = await supabase.storage.from("highlights").createSignedUrl(currentTrack.storage_path, 3600);
       if (isCancelled || !audio) return;
@@ -403,12 +405,14 @@ export function AudioProvider({ children }: { children: ReactNode }) {
         audio.load();
       }
 
-      setCurrentTime(0);
-
       if (shouldBePlayingRef.current) {
         try {
-          await audio.play();
+          await playMediaSafely(audio);
         } catch (playError) {
+          if (isCancelled) {
+            return;
+          }
+
           console.error("Failed to start playback", playError);
           setIsPlaying(false);
         }
@@ -427,7 +431,11 @@ export function AudioProvider({ children }: { children: ReactNode }) {
     if (!audio || !currentTrack) return;
 
     if (isPlaying) {
-      void audio.play().catch((error) => {
+      if (!audio.currentSrc && !audio.src) {
+        return;
+      }
+
+      void playMediaSafely(audio).catch((error) => {
         console.error("Playback toggle failed", error);
         setIsPlaying(false);
       });
@@ -435,7 +443,46 @@ export function AudioProvider({ children }: { children: ReactNode }) {
     }
 
     audio.pause();
-  }, [currentTrack, isPlaying]);
+  }, [isPlaying]);
+
+  useEffect(() => {
+    if (loading) {
+      return;
+    }
+
+    if (!user?.id) {
+      seededUserIdRef.current = null;
+      return;
+    }
+
+    if (seededUserIdRef.current === user.id || currentTrack || contextTracks.length > 0) {
+      return;
+    }
+
+    let isCancelled = false;
+
+    const seedInitialQueue = async () => {
+      try {
+        const inventory = await fetchHighlightInventory(user.id);
+        if (isCancelled || inventory.tracks.length === 0) {
+          return;
+        }
+
+        seededUserIdRef.current = user.id;
+        startContext(inventory.tracks, Math.floor(Math.random() * inventory.tracks.length), false);
+      } catch (error) {
+        if (!isCancelled) {
+          console.error("Failed to seed the initial playback queue", error);
+        }
+      }
+    };
+
+    void seedInitialQueue();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [contextTracks.length, currentTrack, loading, startContext, user?.id]);
 
   useEffect(() => {
     if (typeof navigator === "undefined" || !("mediaSession" in navigator)) {
