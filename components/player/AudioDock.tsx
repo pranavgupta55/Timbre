@@ -93,7 +93,7 @@ function VolumeControl({
   onToggleMute: () => void;
 }) {
   return (
-    <div className="flex items-center gap-3 rounded-full border border-white/10 bg-white/5 px-3 py-2">
+    <div className="flex items-center gap-2.5 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 sm:gap-3 sm:py-2">
       <button type="button" onClick={onToggleMute} className="text-text-dim transition-colors hover:text-text-main" aria-label="Toggle mute">
         {isMuted || volume === 0 ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
       </button>
@@ -104,7 +104,7 @@ function VolumeControl({
         step={0.01}
         value={volume}
         onChange={(event) => onSetVolume(Number.parseFloat(event.target.value))}
-        className="timbre-range timbre-range-volume block h-4 w-24 cursor-pointer"
+        className="timbre-range timbre-range-volume block h-4 w-20 cursor-pointer sm:w-24"
         aria-label="Volume"
       />
     </div>
@@ -123,8 +123,8 @@ function TransportTimeline({
   overlays?: Overlay[];
 }) {
   return (
-    <div className="flex items-center gap-3">
-      <span className="w-11 text-right font-mono text-[11px] text-text-dim">{formatTime(currentTime)}</span>
+    <div className="flex items-center gap-2.5 sm:gap-3">
+      <span className="w-10 text-right font-mono text-[11px] text-text-dim sm:w-11">{formatTime(currentTime)}</span>
       <div className="relative flex-1">
         <div className="pointer-events-none absolute inset-x-0 top-1/2 -translate-y-1/2">
           <div className="relative h-1.5 overflow-hidden rounded-full bg-white/10">
@@ -159,7 +159,7 @@ function TransportTimeline({
           aria-label="Seek"
         />
       </div>
-      <span className="w-11 font-mono text-[11px] text-text-dim">{formatTime(duration)}</span>
+      <span className="w-10 font-mono text-[11px] text-text-dim sm:w-11">{formatTime(duration)}</span>
     </div>
   );
 }
@@ -192,10 +192,10 @@ function TransportShell({
   onToggleMute: () => void;
 }) {
   return (
-    <div className="pointer-events-none fixed inset-x-0 bottom-0 z-50 px-4 pb-4 sm:px-6">
-      <div className="mx-auto w-full max-w-[1480px]">
-        <div className="pointer-events-auto rounded-[30px] border border-white/10 bg-[linear-gradient(180deg,rgba(10,10,11,0.94),rgba(17,17,16,0.88))] px-4 py-3 shadow-[0_30px_120px_rgba(0,0,0,0.44)] backdrop-blur-2xl sm:px-5">
-          <div className="space-y-3 lg:hidden">
+    <div className="pointer-events-none fixed inset-x-0 bottom-0 z-50 px-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] sm:px-5 lg:px-6">
+      <div className="mx-auto w-full max-w-[860px] lg:max-w-[1480px]">
+        <div className="pointer-events-auto rounded-[28px] border border-white/10 bg-[linear-gradient(180deg,rgba(10,10,11,0.92),rgba(17,17,16,0.82))] px-4 py-3 shadow-[0_30px_120px_rgba(0,0,0,0.44)] backdrop-blur-2xl sm:rounded-[30px] sm:px-5 sm:py-3.5">
+          <div className="space-y-2.5 lg:hidden">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0 flex-1">
                 <div className="truncate font-serif text-lg text-text-main sm:text-xl">{title}</div>
@@ -204,7 +204,7 @@ function TransportShell({
               <div className="shrink-0">{rightNode}</div>
             </div>
 
-            <div className="flex items-center justify-center gap-2">{controls}</div>
+            <div className="flex items-center justify-center gap-2.5">{controls}</div>
 
             <TransportTimeline currentTime={currentTime} duration={duration} onSeek={onSeek} overlays={overlays} />
 
@@ -358,7 +358,7 @@ export function AudioDock() {
           <TransportButton onClick={() => void prev()} ariaLabel="Previous track">
             <SkipBack className="h-4 w-4" />
           </TransportButton>
-          <TransportButton onClick={() => void toggle()} accent="gold" ariaLabel={isPlaying ? "Pause" : "Play"} className="p-4">
+          <TransportButton onClick={() => void toggle()} accent="gold" ariaLabel={isPlaying ? "Pause" : "Play"} className="p-3.5 sm:p-4">
             {isPlaying ? <Pause className="h-5 w-5" /> : <Play className="h-5 w-5 translate-x-[1px]" />}
           </TransportButton>
           <TransportButton onClick={() => void next()} ariaLabel="Next track">

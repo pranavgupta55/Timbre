@@ -14,6 +14,14 @@ export function QueuePanel({ className, compact = false }: QueuePanelProps) {
 
   const upcomingContextTracks = contextTracks.slice(currentIndex + 1, currentIndex + (compact ? 5 : 9));
   const visibleManualQueue = compact ? manualQueue.slice(0, 3) : manualQueue;
+  const compactUpcomingTracks = compact
+    ? [
+        ...visibleManualQueue.map((track) => ({ track, source: "manual" as const })),
+        ...upcomingContextTracks
+          .slice(0, Math.max(0, 4 - visibleManualQueue.length))
+          .map((track) => ({ track, source: "context" as const })),
+      ]
+    : [];
   const hiddenQueueCount = manualQueue.length - visibleManualQueue.length;
   const sectionGapClass = compact ? "space-y-4" : "space-y-5";
   const itemSpacingClass = compact ? "space-y-2" : "space-y-3";
@@ -57,9 +65,9 @@ export function QueuePanel({ className, compact = false }: QueuePanelProps) {
             ) : null}
           </div>
 
-          {visibleManualQueue.length > 0 ? (
+          {compactUpcomingTracks.length > 0 ? (
             <ul className={itemSpacingClass}>
-              {visibleManualQueue.map((track, index) => (
+              {compactUpcomingTracks.map(({ track, source }, index) => (
                 <li
                   key={`${track.id}-${index}`}
                   className="flex min-w-0 items-center justify-between gap-3 rounded-3xl border border-white/10 bg-white/[0.04] px-4 py-3"
@@ -67,13 +75,15 @@ export function QueuePanel({ className, compact = false }: QueuePanelProps) {
                   <div className="min-w-0">
                     <div className="truncate font-sans text-sm text-text-main">{track.title}</div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => removeFromManualQueue(track.id)}
-                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-text-dim transition-colors hover:border-accent-red/20 hover:text-accent-red"
-                  >
-                    Remove
-                  </button>
+                  {source === "manual" ? (
+                    <button
+                      type="button"
+                      onClick={() => removeFromManualQueue(track.id)}
+                      className="rounded-full border border-white/10 px-3 py-1 text-xs text-text-dim transition-colors hover:border-accent-red/20 hover:text-accent-red"
+                    >
+                      Remove
+                    </button>
+                  ) : null}
                 </li>
               ))}
             </ul>
