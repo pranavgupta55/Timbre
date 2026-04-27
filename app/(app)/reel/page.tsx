@@ -67,15 +67,15 @@ export default function ReelPage() {
   }, [deferredSearch, tracks]);
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-4 overflow-y-auto pb-2">
+    <div className="flex min-h-full min-w-0 flex-col gap-4 overflow-x-hidden overflow-y-auto pb-2 xl:h-full xl:min-h-0">
       <div className="min-w-0">
         <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-accent-red">Player</div>
         <h1 className="mt-1 truncate font-serif text-2xl text-text-main sm:text-4xl">Highlights</h1>
       </div>
 
-      <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-        <section className="editor-surface flex min-h-0 flex-col rounded-[32px] p-4 sm:p-5">
-          <div className="mb-4 xl:hidden">
+      <div className="grid min-w-0 gap-4 xl:min-h-0 xl:flex-1 xl:grid-cols-[minmax(0,1fr)_320px]">
+        <section className="editor-surface flex min-w-0 flex-col overflow-hidden rounded-[32px] p-4 sm:p-5 xl:min-h-0">
+          <div className="mb-4 min-w-0 xl:hidden">
             <QueuePanel compact />
           </div>
 
@@ -118,7 +118,7 @@ export default function ReelPage() {
               No highlights found.
             </div>
           ) : (
-            <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
+            <div className="mt-4 min-w-0 xl:min-h-0 xl:flex-1 xl:overflow-y-auto xl:pr-1">
               <div className="space-y-3">
                 {filteredTracks.map((track, index) => {
                   const isActive = currentTrack?.id === track.id;
@@ -136,13 +136,13 @@ export default function ReelPage() {
                         }
                       }}
                       className={cn(
-                        "rounded-[26px] border px-4 py-4 transition-all",
+                        "min-w-0 overflow-hidden rounded-[26px] border px-4 py-4 transition-all",
                         isActive
                           ? "border-accent-green/25 bg-accent-green/12 shadow-[0_16px_40px_rgba(103,185,143,0.14)]"
                           : "border-white/10 bg-white/[0.04] hover:bg-white/[0.06]",
                       )}
                     >
-                      <div className="flex flex-col gap-3 min-[420px]:flex-row min-[420px]:items-start min-[420px]:justify-between">
+                      <div className="flex min-w-0 flex-col gap-3 min-[420px]:flex-row min-[420px]:items-start min-[420px]:justify-between">
                         <div className="min-w-0 flex-1">
                           <div className="truncate font-sans text-sm text-text-main">{track.title}</div>
                         </div>
@@ -184,7 +184,7 @@ export default function ReelPage() {
           )}
         </section>
 
-        <aside className="hidden min-h-0 xl:block">
+        <aside className="hidden min-h-0 min-w-0 xl:block">
           <QueuePanel className="h-full" />
         </aside>
       </div>

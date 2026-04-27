@@ -27,7 +27,7 @@ export interface Track {
   uploadedAt: string;
 }
 
-type RepeatMode = "off" | "all";
+type RepeatMode = "off" | "one";
 
 interface AudioContextType {
   contextTracks: Track[];
@@ -178,7 +178,44 @@ export function AudioProvider({ children }: { children: ReactNode }) {
     setCurrentTime(time);
   }, []);
 
+  const restartCurrentTrack = useCallback(
+    async (autoplay = true) => {
+      if (!currentTrack) return;
+
+      const audio = audioRef.current;
+      if (!audio || (!audio.currentSrc && !audio.src)) {
+        setCurrentTime(0);
+        setIsPlaying(autoplay);
+        return;
+      }
+
+      audio.currentTime = 0;
+      setCurrentTime(0);
+      setDuration(Number.isFinite(audio.duration) ? audio.duration : 0);
+
+      if (!autoplay) {
+        audio.pause();
+        setIsPlaying(false);
+        return;
+      }
+
+      try {
+        await playMediaSafely(audio);
+        setIsPlaying(true);
+      } catch (error) {
+        console.error("Failed to restart playback", error);
+        setIsPlaying(false);
+      }
+    },
+    [currentTrack],
+  );
+
   const next = useCallback(async () => {
+    if (repeatMode === "one" && currentTrack) {
+      await restartCurrentTrack(true);
+      return;
+    }
+
     if (manualQueue.length > 0) {
       const [nextManualTrack, ...remainingQueue] = manualQueue;
       setManualQueue(remainingQueue);
@@ -189,13 +226,13 @@ export function AudioProvider({ children }: { children: ReactNode }) {
       return;
     }
 
-    const nextIndex = currentIndex + 1;
-    if (nextIndex < contextTracks.length) {
+    if (contextTracks.length > 0) {
+      const nextIndex = currentIndex >= 0 && currentIndex + 1 < contextTracks.length ? currentIndex + 1 : 0;
       selectContextTrack(nextIndex, true);
       return;
     }
 
-    if (repeatMode === "all" && originalContextTracks.length > 0) {
+    if (originalContextTracks.length > 0) {
       startContext(originalContextTracks, 0, true);
       return;
     }
@@ -209,7 +246,7 @@ export function AudioProvider({ children }: { children: ReactNode }) {
     manualQueue,
     originalContextTracks,
     repeatMode,
-    seek,
+    restartCurrentTrack,
     selectContextTrack,
     startContext,
   ]);
@@ -276,7 +313,7 @@ export function AudioProvider({ children }: { children: ReactNode }) {
   }, [currentTrack?.id, isShuffle, originalContextTracks]);
 
   const cycleRepeatMode = useCallback(() => {
-    setRepeatMode((current) => (current === "off" ? "all" : "off"));
+    setRepeatMode((current) => (current === "off" ? "one" : "off"));
   }, []);
 
   const setVolume = useCallback(

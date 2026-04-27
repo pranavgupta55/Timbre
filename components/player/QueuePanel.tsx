@@ -13,23 +13,27 @@ export function QueuePanel({ className, compact = false }: QueuePanelProps) {
   const { currentTrack, manualQueue, contextTracks, currentIndex, removeFromManualQueue, clearManualQueue } = useAudio();
 
   const upcomingContextTracks = contextTracks.slice(currentIndex + 1, currentIndex + (compact ? 5 : 9));
-  const sectionGapClass = compact ? "space-y-5" : "space-y-5";
+  const visibleManualQueue = compact ? manualQueue.slice(0, 3) : manualQueue;
+  const hiddenQueueCount = manualQueue.length - visibleManualQueue.length;
+  const sectionGapClass = compact ? "space-y-4" : "space-y-5";
   const itemSpacingClass = compact ? "space-y-2" : "space-y-3";
   const maxUpcomingHeight = compact ? "max-h-40" : "max-h-64";
 
   return (
     <div
       className={cn(
-        "rounded-[28px] border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.08),rgba(255,255,255,0.03))] p-4 shadow-[0_22px_80px_rgba(0,0,0,0.28)] backdrop-blur-2xl sm:p-5",
+        compact
+          ? "min-w-0 w-full overflow-hidden rounded-[24px] border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.08),rgba(255,255,255,0.03))] p-3.5 shadow-[0_22px_80px_rgba(0,0,0,0.28)] backdrop-blur-2xl sm:p-4"
+          : "min-w-0 w-full overflow-hidden rounded-[28px] border border-white/10 bg-[linear-gradient(180deg,rgba(255,255,255,0.08),rgba(255,255,255,0.03))] p-4 shadow-[0_22px_80px_rgba(0,0,0,0.28)] backdrop-blur-2xl sm:p-5",
         className,
       )}
     >
       <div className={sectionGapClass}>
-        <section className="space-y-3">
+        <section className="min-w-0 space-y-3">
           <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">Current queue</div>
           {currentTrack ? (
-            <div className="rounded-3xl border border-accent-gold/20 bg-accent-gold/10 p-4">
-              <div className="truncate font-serif text-xl text-text-main">{currentTrack.title}</div>
+            <div className={cn("min-w-0 rounded-3xl border border-accent-gold/20 bg-accent-gold/10", compact ? "p-3.5" : "p-4")}>
+              <div className={cn("truncate font-serif text-text-main", compact ? "text-lg" : "text-xl")}>{currentTrack.title}</div>
             </div>
           ) : (
             <div className="rounded-3xl border border-dashed border-white/10 bg-white/[0.03] p-4 font-sans text-sm text-text-dim">
@@ -38,7 +42,7 @@ export function QueuePanel({ className, compact = false }: QueuePanelProps) {
           )}
         </section>
 
-        <section className="space-y-3">
+        <section className="min-w-0 space-y-3">
           <div className="flex items-center justify-between gap-3">
             <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">Up next</div>
             {manualQueue.length > 0 ? (
@@ -53,12 +57,12 @@ export function QueuePanel({ className, compact = false }: QueuePanelProps) {
             ) : null}
           </div>
 
-          {manualQueue.length > 0 ? (
+          {visibleManualQueue.length > 0 ? (
             <ul className={itemSpacingClass}>
-              {manualQueue.map((track, index) => (
+              {visibleManualQueue.map((track, index) => (
                 <li
                   key={`${track.id}-${index}`}
-                  className="flex items-center justify-between gap-3 rounded-3xl border border-white/10 bg-white/[0.04] px-4 py-3"
+                  className="flex min-w-0 items-center justify-between gap-3 rounded-3xl border border-white/10 bg-white/[0.04] px-4 py-3"
                 >
                   <div className="min-w-0">
                     <div className="truncate font-sans text-sm text-text-main">{track.title}</div>
@@ -78,28 +82,34 @@ export function QueuePanel({ className, compact = false }: QueuePanelProps) {
               Queue is empty.
             </div>
           )}
+
+          {compact && hiddenQueueCount > 0 ? (
+            <div className="font-sans text-[11px] uppercase tracking-[0.16em] text-text-dim">+{hiddenQueueCount} more queued</div>
+          ) : null}
         </section>
 
-        <section className="space-y-3">
-          <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">More from library</div>
+        {compact ? null : (
+          <section className="min-w-0 space-y-3">
+            <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">More from library</div>
 
-          {upcomingContextTracks.length > 0 ? (
-            <ul className={cn(itemSpacingClass, maxUpcomingHeight, "overflow-y-auto pr-1")}>
-              {upcomingContextTracks.map((track, index) => (
-                <li
-                  key={`${track.id}-${index}`}
-                  className="rounded-3xl border border-white/10 bg-white/[0.04] px-4 py-3"
-                >
-                  <div className="truncate font-sans text-sm text-text-main">{track.title}</div>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <div className="rounded-3xl border border-dashed border-white/10 bg-white/[0.03] p-4 font-sans text-sm text-text-dim">
-              End of queue.
-            </div>
-          )}
-        </section>
+            {upcomingContextTracks.length > 0 ? (
+              <ul className={cn(itemSpacingClass, maxUpcomingHeight, "overflow-y-auto pr-1")}>
+                {upcomingContextTracks.map((track, index) => (
+                  <li
+                    key={`${track.id}-${index}`}
+                    className="rounded-3xl border border-white/10 bg-white/[0.04] px-4 py-3"
+                  >
+                    <div className="truncate font-sans text-sm text-text-main">{track.title}</div>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="rounded-3xl border border-dashed border-white/10 bg-white/[0.03] p-4 font-sans text-sm text-text-dim">
+                End of queue.
+              </div>
+            )}
+          </section>
+        )}
       </div>
     </div>
   );

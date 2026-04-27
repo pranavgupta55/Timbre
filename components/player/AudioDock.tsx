@@ -7,6 +7,7 @@ import {
   Pause,
   Play,
   Repeat,
+  Repeat1,
   RotateCcw,
   RotateCw,
   Shuffle,
@@ -365,11 +366,11 @@ export function AudioDock() {
           </TransportButton>
           <TransportButton
             onClick={cycleRepeatMode}
-            active={repeatMode === "all"}
-            accent={repeatMode === "all" ? "green" : "default"}
-            ariaLabel="Toggle repeat"
+            active={repeatMode === "one"}
+            accent={repeatMode === "one" ? "green" : "default"}
+            ariaLabel="Toggle repeat current track"
           >
-            <Repeat className="h-4 w-4" />
+            {repeatMode === "one" ? <Repeat1 className="h-4 w-4" /> : <Repeat className="h-4 w-4" />}
           </TransportButton>
         </>
       }
