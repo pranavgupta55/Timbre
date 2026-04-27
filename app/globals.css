@@ -88,6 +88,17 @@
   animation: grid-shift 18s linear infinite;
 }
 
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
 .editor-surface {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.085), rgba(255, 255, 255, 0.03));
   border: 1px solid rgba(255, 255, 255, 0.1);

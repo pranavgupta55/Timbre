@@ -103,7 +103,7 @@ export function QueuePanel({ className, compact = false }: QueuePanelProps) {
             <div className="font-sans text-[11px] uppercase tracking-[0.18em] text-text-dim">More from library</div>
 
             {upcomingContextTracks.length > 0 ? (
-              <ul className={cn(itemSpacingClass, maxUpcomingHeight, "overflow-y-auto pr-1")}>
+              <ul className={cn(itemSpacingClass, maxUpcomingHeight, "overflow-y-auto pr-1 scrollbar-none")}>
                 {upcomingContextTracks.map((track, index) => (
                   <li
                     key={`${track.id}-${index}`}
